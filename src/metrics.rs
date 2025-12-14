@@ -1,8 +1,8 @@
 use crate::error::DpcError;
 use crate::types::{
     ColorDiff, ColorDiffKind, ColorMetric, ContentMetric, DiffSeverity, LayoutDiffKind,
-    LayoutDiffRegion, LayoutMetric, MetricScores, NormalizedView, PixelDiffReason, PixelDiffRegion,
-    PixelMetric, TypographyDiff, TypographyIssue, TypographyMetric,
+    LayoutDiffRegion, LayoutMetric, MetricScores, NormalizedView, PixelMetric, TypographyDiff,
+    TypographyIssue, TypographyMetric,
 };
 use crate::Result;
 use image::{DynamicImage, GenericImageView};
@@ -1627,8 +1627,8 @@ fn token_similarity(a: &str, b: &str) -> f32 {
 mod tests {
     use super::*;
     use crate::types::{
-        ColorMetric, ComputedStyle, ContentMetric, LayoutMetric, PixelMetric, ResourceKind,
-        TypographyMetric, TypographyStyle,
+        ColorMetric, ComputedStyle, ContentMetric, LayoutMetric, PixelDiffReason, PixelDiffRegion,
+        PixelMetric, ResourceKind, TypographyMetric, TypographyStyle,
     };
     use image::{ImageFormat, Rgba, RgbaImage};
     use std::cell::RefCell;
@@ -1966,6 +1966,47 @@ mod tests {
                 .any(|m| m.to_ascii_lowercase().contains("color shift")),
             "color issue should be present: {:?}",
             all_issues
+        );
+    }
+
+    #[test]
+    fn generate_top_issues_prioritizes_palette_over_typography() {
+        let scores = MetricScores {
+            pixel: None,
+            layout: None,
+            typography: Some(TypographyMetric {
+                score: 0.7,
+                diffs: vec![TypographyDiff {
+                    element_id_ref: Some("caption".into()),
+                    element_id_impl: Some("caption_impl".into()),
+                    issues: vec![TypographyIssue::LineHeightDiff],
+                    details: None,
+                }],
+            }),
+            color: Some(ColorMetric {
+                score: 0.6,
+                diffs: vec![ColorDiff {
+                    kind: ColorDiffKind::BackgroundColorShift,
+                    ref_color: "#111111".to_string(),
+                    impl_color: "#222222".to_string(),
+                    delta_e: Some(4.0),
+                }],
+            }),
+            content: None,
+        };
+
+        let issues = generate_top_issues(&scores, 5);
+        let color_idx = issues
+            .iter()
+            .position(|m| m.to_ascii_lowercase().contains("color shift"))
+            .expect("color issue present");
+        let typo_idx = issues
+            .iter()
+            .position(|m| m.to_ascii_lowercase().contains("line height"))
+            .expect("typography issue present");
+        assert!(
+            color_idx < typo_idx,
+            "palette shifts should outrank minor typography issues"
         );
     }
 
