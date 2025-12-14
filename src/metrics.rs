@@ -155,7 +155,7 @@ enum ElementKind {
 }
 
 impl LayoutSimilarity {
-    fn extract_elements(view: &NormalizedView) -> Option<Vec<LayoutElement>> {
+    fn extract_elements(view: &NormalizedView) -> Vec<LayoutElement> {
         if let Some(dom) = &view.dom {
             let elements = dom
                 .nodes
@@ -166,7 +166,7 @@ impl LayoutSimilarity {
                 })
                 .collect::<Vec<_>>();
             if !elements.is_empty() {
-                return Some(elements);
+                return elements;
             }
         }
 
@@ -180,11 +180,11 @@ impl LayoutSimilarity {
                 })
                 .collect::<Vec<_>>();
             if !elements.is_empty() {
-                return Some(elements);
+                return elements;
             }
         }
 
-        None
+        Vec::new()
     }
 }
 
@@ -198,13 +198,33 @@ impl Metric for LayoutSimilarity {
         reference: &NormalizedView,
         implementation: &NormalizedView,
     ) -> Result<MetricResult> {
-        let ref_elements = LayoutSimilarity::extract_elements(reference).ok_or_else(|| {
-            DpcError::Config("No layout elements available in reference view".to_string())
-        })?;
-        let mut impl_elements =
-            LayoutSimilarity::extract_elements(implementation).ok_or_else(|| {
-                DpcError::Config("No layout elements available in implementation view".to_string())
-            })?;
+        let ref_elements = LayoutSimilarity::extract_elements(reference);
+        if ref_elements.is_empty() {
+            return Err(DpcError::Config(
+                "No layout elements available in reference view".to_string(),
+            ));
+        }
+        let mut impl_elements = LayoutSimilarity::extract_elements(implementation);
+
+        if impl_elements.is_empty() {
+            let diff_regions = ref_elements
+                .iter()
+                .map(|ref_el| LayoutDiffRegion {
+                    x: ref_el.bbox.x,
+                    y: ref_el.bbox.y,
+                    width: ref_el.bbox.width,
+                    height: ref_el.bbox.height,
+                    kind: LayoutDiffKind::MissingElement,
+                    element_type: Some(ref_el.kind.as_str().to_string()),
+                    label: None,
+                })
+                .collect::<Vec<_>>();
+
+            return Ok(MetricResult::Layout(LayoutMetric {
+                score: 0.0,
+                diff_regions,
+            }));
+        }
 
         let ref_count = ref_elements.len();
         let impl_count = impl_elements.len();
@@ -733,7 +753,7 @@ pub fn run_metrics(
         selected.to_vec()
     };
 
-    let layout_available = has_layout_data(reference) && has_layout_data(implementation);
+    let layout_available = has_layout_data(reference);
     let typography_available =
         has_typography_data(reference) && has_typography_data(implementation);
     let content_available = has_content_data(reference) && has_content_data(implementation);
@@ -856,32 +876,38 @@ pub fn calculate_combined_score(scores: &MetricScores, weights: &ScoreWeights) -
     }
 }
 
+const PRIORITY_PIXEL: u8 = 0;
+const PRIORITY_LAYOUT: u8 = 1;
+const PRIORITY_CONTENT: u8 = 2;
+const PRIORITY_COLOR: u8 = 3;
+const PRIORITY_TYPOGRAPHY: u8 = 4;
+
 #[derive(Debug, Clone)]
 struct RankedIssue {
     severity_rank: u8,
+    priority_rank: u8,
     message: String,
 }
 
 impl RankedIssue {
-    fn major(message: impl Into<String>) -> Self {
+    fn new(severity_rank: u8, priority_rank: u8, message: impl Into<String>) -> Self {
         Self {
-            severity_rank: 0,
+            severity_rank,
+            priority_rank,
             message: message.into(),
         }
     }
 
-    fn moderate(message: impl Into<String>) -> Self {
-        Self {
-            severity_rank: 1,
-            message: message.into(),
-        }
+    fn major(priority_rank: u8, message: impl Into<String>) -> Self {
+        Self::new(0, priority_rank, message)
     }
 
-    fn minor(message: impl Into<String>) -> Self {
-        Self {
-            severity_rank: 2,
-            message: message.into(),
-        }
+    fn moderate(priority_rank: u8, message: impl Into<String>) -> Self {
+        Self::new(1, priority_rank, message)
+    }
+
+    fn minor(priority_rank: u8, message: impl Into<String>) -> Self {
+        Self::new(2, priority_rank, message)
     }
 }
 
@@ -911,6 +937,7 @@ pub fn generate_top_issues(scores: &MetricScores, max_issues: usize) -> Vec<Stri
     issues.sort_by(|a, b| {
         a.severity_rank
             .cmp(&b.severity_rank)
+            .then_with(|| a.priority_rank.cmp(&b.priority_rank))
             .then_with(|| a.message.cmp(&b.message))
     });
     issues
@@ -940,25 +967,34 @@ fn issues_from_pixel(metric: &PixelMetric) -> Vec<RankedIssue> {
         .count();
 
     if major_count > 0 {
-        issues.push(RankedIssue::major(format!(
+        issues.push(RankedIssue::major(
+            PRIORITY_PIXEL,
+            format!(
             "{} major pixel difference region{} detected.",
             major_count,
             if major_count == 1 { "" } else { "s" }
-        )));
+            ),
+        ));
     }
     if moderate_count > 0 {
-        issues.push(RankedIssue::moderate(format!(
+        issues.push(RankedIssue::moderate(
+            PRIORITY_PIXEL,
+            format!(
             "{} moderate pixel difference region{} detected.",
             moderate_count,
             if moderate_count == 1 { "" } else { "s" }
-        )));
+            ),
+        ));
     }
     if minor_count > 0 {
-        issues.push(RankedIssue::minor(format!(
+        issues.push(RankedIssue::minor(
+            PRIORITY_PIXEL,
+            format!(
             "{} minor pixel difference region{} detected.",
             minor_count,
             if minor_count == 1 { "" } else { "s" }
-        )));
+            ),
+        ));
     }
 
     issues
@@ -994,10 +1030,10 @@ fn issues_from_layout(metric: &LayoutMetric) -> Vec<RankedIssue> {
         };
 
         let ranked = match region.kind {
-            LayoutDiffKind::MissingElement => RankedIssue::major(msg),
-            LayoutDiffKind::ExtraElement => RankedIssue::moderate(msg),
+            LayoutDiffKind::MissingElement => RankedIssue::major(PRIORITY_LAYOUT, msg),
+            LayoutDiffKind::ExtraElement => RankedIssue::moderate(PRIORITY_LAYOUT, msg),
             LayoutDiffKind::PositionShift | LayoutDiffKind::SizeChange => {
-                RankedIssue::moderate(msg)
+                RankedIssue::moderate(PRIORITY_LAYOUT, msg)
             }
         };
         issues.push(ranked);
@@ -1046,13 +1082,13 @@ fn issues_from_typography(metric: &TypographyMetric) -> Vec<RankedIssue> {
         };
 
         let ranked = if diff.issues.contains(&TypographyIssue::FontFamilyMismatch) {
-            RankedIssue::major(msg)
+            RankedIssue::major(PRIORITY_TYPOGRAPHY, msg)
         } else if diff.issues.contains(&TypographyIssue::FontSizeDiff)
             || diff.issues.contains(&TypographyIssue::FontWeightDiff)
         {
-            RankedIssue::moderate(msg)
+            RankedIssue::moderate(PRIORITY_TYPOGRAPHY, msg)
         } else {
-            RankedIssue::minor(msg)
+            RankedIssue::minor(PRIORITY_TYPOGRAPHY, msg)
         };
 
         issues.push(ranked);
@@ -1077,9 +1113,9 @@ fn issues_from_color(metric: &ColorMetric) -> Vec<RankedIssue> {
         );
 
         let ranked = match diff.kind {
-            ColorDiffKind::PrimaryColorShift => RankedIssue::major(msg),
-            ColorDiffKind::AccentColorShift => RankedIssue::major(msg),
-            ColorDiffKind::BackgroundColorShift => RankedIssue::minor(msg),
+            ColorDiffKind::PrimaryColorShift => RankedIssue::major(PRIORITY_COLOR, msg),
+            ColorDiffKind::AccentColorShift => RankedIssue::major(PRIORITY_COLOR, msg),
+            ColorDiffKind::BackgroundColorShift => RankedIssue::minor(PRIORITY_COLOR, msg),
         };
         issues.push(ranked);
     }
@@ -1099,16 +1135,19 @@ fn issues_from_content(metric: &ContentMetric) -> Vec<RankedIssue> {
                 } else {
                     text.clone()
                 };
-                issues.push(RankedIssue::major(format!(
-                    "Text '{}' is missing in the implementation.",
-                    truncated
-                )));
+                issues.push(RankedIssue::major(
+                    PRIORITY_CONTENT,
+                    format!("Text '{}' is missing in the implementation.", truncated),
+                ));
             }
         } else {
-            issues.push(RankedIssue::major(format!(
-                "{} text elements are missing in the implementation.",
-                count
-            )));
+            issues.push(RankedIssue::major(
+                PRIORITY_CONTENT,
+                format!(
+                    "{} text elements are missing in the implementation.",
+                    count
+                ),
+            ));
         }
     }
 
@@ -1121,16 +1160,22 @@ fn issues_from_content(metric: &ContentMetric) -> Vec<RankedIssue> {
                 } else {
                     text.clone()
                 };
-                issues.push(RankedIssue::minor(format!(
-                    "Extra text '{}' appears in implementation but not in design.",
-                    truncated
-                )));
+                issues.push(RankedIssue::minor(
+                    PRIORITY_CONTENT,
+                    format!(
+                        "Extra text '{}' appears in implementation but not in design.",
+                        truncated
+                    ),
+                ));
             }
         } else {
-            issues.push(RankedIssue::minor(format!(
-                "{} extra text elements appear in implementation but not in design.",
-                count
-            )));
+            issues.push(RankedIssue::minor(
+                PRIORITY_CONTENT,
+                format!(
+                    "{} extra text elements appear in implementation but not in design.",
+                    count
+                ),
+            ));
         }
     }
 
@@ -1696,6 +1741,32 @@ mod tests {
     }
 
     #[test]
+    fn run_metrics_scores_layout_even_when_impl_is_empty() {
+        let ref_view = view_with_dom(vec![("button", bbox(0.0, 0.0, 0.5, 0.5))]);
+        let impl_view = view_with_dom(vec![]);
+        let scores = run_metrics(
+            &default_metrics(),
+            &[MetricKind::Layout],
+            &ref_view,
+            &impl_view,
+        )
+        .expect("layout metric should return a low score instead of erroring");
+
+        let layout = scores
+            .layout
+            .expect("layout metric should be present even when implementation has no elements");
+        assert!(
+            layout.score <= 0.05,
+            "layout score should be near zero when implementation is empty: {}",
+            layout.score
+        );
+        assert!(
+            !layout.diff_regions.is_empty(),
+            "missing elements should be reported as diff regions"
+        );
+    }
+
+    #[test]
     fn combined_score_rescales_to_present_metrics() {
         let weights = ScoreWeights {
             pixel: 0.7,
@@ -1989,14 +2060,24 @@ mod tests {
         ]);
         let impl_view = view_with_dom(vec![]); // no matching elements
         let metric = LayoutSimilarity::default();
-        let err = metric
-            .compute(&ref_view, &impl_view)
-            .expect_err("should error on empty implementation layout");
-        let msg = format!("{err:?}").to_ascii_lowercase();
+        let layout = match metric.compute(&ref_view, &impl_view).expect("should score even when implementation layout is empty") {
+            MetricResult::Layout(m) => m,
+            _ => unreachable!(),
+        };
         assert!(
-            msg.contains("implementation"),
-            "expected implementation layout error, got {msg}"
+            layout.score <= 0.05,
+            "score should be very low when implementation is empty: {}",
+            layout.score
         );
+        assert_eq!(
+            layout.diff_regions.len(),
+            2,
+            "should mark all reference elements as missing"
+        );
+        assert!(layout
+            .diff_regions
+            .iter()
+            .all(|d| matches!(d.kind, LayoutDiffKind::MissingElement)));
     }
 
     #[test]
