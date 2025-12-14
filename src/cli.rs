@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[command(
     version,
     about = "Design Parity Checker - Compare implementations against design references",
-    long_about = "Design Parity Checker (DPC)\n\nModes:\n- compare: measure similarity between a reference (Figma/URL/image) and an implementation (Figma/URL/image).\n- generate-code: stub for future code generation.\n- quality: experimental reference-free scoring.\n\nUse --help on any subcommand for details."
+    long_about = "Design Parity Checker (DPC)\n\nModes:\n- compare: measure similarity between a reference (Figma/URL/image) and an implementation (Figma/URL/image).\n- generate-code: create HTML/Tailwind from a single input via a screenshot-to-code backend (or mock).\n- quality: experimental reference-free scoring.\n\nUse --help on any subcommand for details."
 )]
 #[command(propagate_version = true)]
 pub struct Cli {
@@ -141,7 +141,11 @@ pub enum Commands {
         )]
         viewport: Viewport,
 
-        #[arg(long, short, help = "Output file path")]
+        #[arg(
+            long,
+            short,
+            help = "Write generated code to this file (JSON status is printed to stdout)"
+        )]
         output: Option<PathBuf>,
 
         #[arg(long, value_enum, default_value = "json", help = "Output format")]

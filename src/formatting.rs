@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use dpc_lib::output::DPC_OUTPUT_VERSION;
-use dpc_lib::{DpcError, DpcOutput, ErrorOutput};
+use dpc_lib::{DpcError, DpcOutput, ErrorOutput, QualityFindingType};
 
 use crate::cli::OutputFormat;
 
@@ -55,7 +55,10 @@ pub fn render_error(err: DpcError, format: OutputFormat, output: Option<PathBuf>
 }
 
 /// Write JSON output to file or stdout.
-fn write_json_output(body: &DpcOutput, output: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+fn write_json_output(
+    body: &DpcOutput,
+    output: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let content = serde_json::to_string(body)?;
     if let Some(path) = output {
         std::fs::write(path, content)?;
@@ -180,6 +183,25 @@ pub fn format_pretty(body: &DpcOutput, colorize: bool) -> String {
                     for (label, path) in paths {
                         writeln!(buf, "- {:16} {}", label, path.display()).ok();
                     }
+                    let mut hints = Vec::new();
+                    if art.diff_image.is_some() {
+                        hints.push("diff_heatmap.png");
+                    }
+                    if art.ref_dom_snapshot.is_some() || art.impl_dom_snapshot.is_some() {
+                        hints.push("ref_dom.json/impl_dom.json");
+                    }
+                    if art.ref_figma_snapshot.is_some() || art.impl_figma_snapshot.is_some() {
+                        hints.push("ref_figma.json/impl_figma.json");
+                    }
+                    if !hints.is_empty() {
+                        writeln!(
+                            buf,
+                            "Hint: open {} in {}",
+                            hints.join(", "),
+                            art.directory.display()
+                        )
+                        .ok();
+                    }
                 }
             }
 
@@ -188,13 +210,29 @@ pub fn format_pretty(body: &DpcOutput, colorize: bool) -> String {
         DpcOutput::GenerateCode(out) => {
             let mut buf = String::new();
             let header = color("[GENERATE]", "36", colorize);
-            writeln!(buf, "{} Code generation (stub)", header).ok();
+            writeln!(buf, "{} Code generated", header).ok();
             writeln!(
                 buf,
                 "Input: {} (kind: {:?})",
                 out.input.value, out.input.kind
             )
             .ok();
+            if let Some(stack) = &out.stack {
+                writeln!(buf, "Stack: {}", stack).ok();
+            }
+            if let Some(path) = &out.output_path {
+                writeln!(buf, "Saved to: {}", path.display()).ok();
+            } else {
+                writeln!(buf, "Tip: pass --output to write the code to disk.").ok();
+            }
+            if let Some(code) = &out.code {
+                let preview: String = code.lines().take(3).collect::<Vec<_>>().join("\n");
+                writeln!(buf, "Code length: {} chars", code.len()).ok();
+                if !preview.is_empty() {
+                    writeln!(buf, "Preview:").ok();
+                    writeln!(buf, "{}", preview).ok();
+                }
+            }
             if let Some(summary) = &out.summary {
                 if !summary.top_issues.is_empty() {
                     writeln!(buf, "Notes:").ok();
@@ -218,7 +256,14 @@ pub fn format_pretty(body: &DpcOutput, colorize: bool) -> String {
             if !out.findings.is_empty() {
                 writeln!(buf, "Findings:").ok();
                 for finding in &out.findings {
-                    writeln!(buf, "- [{:?}] {}", finding.severity, finding.message).ok();
+                    let severity = format!("{:?}", finding.severity).to_ascii_lowercase();
+                    let kind = match finding.finding_type {
+                        QualityFindingType::AlignmentInconsistent => "alignment_inconsistent",
+                        QualityFindingType::SpacingInconsistent => "spacing_inconsistent",
+                        QualityFindingType::LowContrast => "low_contrast",
+                        QualityFindingType::MissingHierarchy => "missing_hierarchy",
+                    };
+                    writeln!(buf, "- [{}] {}: {}", severity, kind, finding.message).ok();
                 }
             }
             buf
@@ -272,7 +317,9 @@ pub fn exit_code_for_compare(passed: bool) -> ExitCode {
 mod tests {
     use super::*;
     use dpc_lib::output::{CompareOutput, ResourceDescriptor, Summary};
-    use dpc_lib::types::{ColorMetric, LayoutMetric, MetricScores, PixelMetric, ResourceKind, Viewport};
+    use dpc_lib::types::{
+        ColorMetric, LayoutMetric, MetricScores, PixelMetric, ResourceKind, Viewport,
+    };
     use dpc_lib::CompareArtifacts;
     use std::path::PathBuf;
 
