@@ -1,3 +1,4 @@
+use crate::error::ErrorPayload;
 use crate::types::{MetricScores, ResourceKind, Viewport};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ pub enum DpcOutput {
     Compare(CompareOutput),
     GenerateCode(GenerateCodeOutput),
     Quality(QualityOutput),
+    Error(ErrorOutput),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +21,7 @@ pub enum OutputMode {
     Compare,
     GenerateCode,
     Quality,
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +46,8 @@ pub struct CompareOutput {
     pub metrics: MetricScores,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<Summary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<CompareArtifacts>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,12 +93,44 @@ pub struct QualityFinding {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareArtifacts {
+    pub directory: PathBuf,
+    #[serde(default)]
+    pub kept: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_screenshot: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impl_screenshot: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_image: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_dom_snapshot: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impl_dom_snapshot: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_figma_snapshot: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impl_figma_snapshot: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FindingSeverity {
     Info,
     Warning,
     Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorOutput {
+    pub version: String,
+    /// Convenience top-level message for pipelines that expect `message` alongside `error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub error: ErrorPayload,
 }
 
 #[cfg(test)]
@@ -129,11 +166,59 @@ mod tests {
             summary: Some(Summary {
                 top_issues: vec!["Minor color shift".into()],
             }),
+            artifacts: None,
         });
 
         let json = serde_json::to_string(&output).expect("serialize compare output");
         assert!(json.contains("\"mode\":\"compare\""));
         assert!(json.contains("\"similarity\":0.93"));
+    }
+
+    #[test]
+    fn compare_output_with_artifacts_serializes() {
+        let artifacts = CompareArtifacts {
+            directory: PathBuf::from("/tmp/dpc-123"),
+            kept: true,
+            ref_screenshot: Some(PathBuf::from("/tmp/dpc-123/ref.png")),
+            impl_screenshot: Some(PathBuf::from("/tmp/dpc-123/impl.png")),
+            diff_image: Some(PathBuf::from("/tmp/dpc-123/diff.png")),
+            ref_dom_snapshot: None,
+            impl_dom_snapshot: Some(PathBuf::from("/tmp/dpc-123/impl_dom.json")),
+            ref_figma_snapshot: None,
+            impl_figma_snapshot: None,
+        };
+
+        let output = DpcOutput::Compare(CompareOutput {
+            version: DPC_OUTPUT_VERSION.to_string(),
+            ref_resource: ResourceDescriptor {
+                kind: ResourceKind::Image,
+                value: "ref.png".to_string(),
+            },
+            impl_resource: ResourceDescriptor {
+                kind: ResourceKind::Url,
+                value: "https://example.com".to_string(),
+            },
+            viewport: Viewport {
+                width: 1440,
+                height: 900,
+            },
+            similarity: 0.93,
+            threshold: 0.9,
+            passed: true,
+            metrics: MetricScores {
+                pixel: None,
+                layout: None,
+                typography: None,
+                color: None,
+                content: None,
+            },
+            summary: None,
+            artifacts: Some(artifacts),
+        });
+
+        let json = serde_json::to_string(&output).expect("serialize compare output");
+        assert!(json.contains("\"artifacts\""));
+        assert!(json.contains("/tmp/dpc-123/ref.png"));
     }
 
     #[test]
@@ -183,5 +268,23 @@ mod tests {
         assert!(json.contains("\"mode\":\"quality\""));
         assert!(json.contains("\"score\":0.82"));
         assert!(json.contains("\"severity\":\"warning\""));
+    }
+
+    #[test]
+    fn error_output_serializes() {
+        let output = DpcOutput::Error(ErrorOutput {
+            version: DPC_OUTPUT_VERSION.to_string(),
+            message: Some("missing ref".to_string()),
+            error: crate::error::ErrorPayload::new(
+                crate::error::ErrorCategory::Config,
+                "missing ref".to_string(),
+                "provide --ref",
+            ),
+        });
+
+        let json = serde_json::to_string(&output).expect("serialize error output");
+        assert!(json.contains("\"mode\":\"error\""));
+        assert!(json.contains("\"missing ref\""));
+        assert!(json.contains("\"message\""));
     }
 }

@@ -26,8 +26,8 @@ pub use metrics::{
     MetricKind, MetricResult, ScoreWeights,
 };
 pub use output::{
-    CompareOutput, DpcOutput, FindingSeverity, GenerateCodeOutput, QualityFinding, QualityOutput,
-    ResourceDescriptor, Summary,
+    CompareArtifacts, CompareOutput, DpcOutput, ErrorOutput, FindingSeverity, GenerateCodeOutput,
+    QualityFinding, QualityOutput, ResourceDescriptor, Summary, DPC_OUTPUT_VERSION,
 };
 pub use resource::{parse_resource, FigmaInfo, ParsedResource};
 pub use types::{
