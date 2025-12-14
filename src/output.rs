@@ -89,7 +89,7 @@ pub struct QualityOutput {
 pub struct QualityFinding {
     pub severity: FindingSeverity,
     #[serde(rename = "type")]
-    pub finding_type: String,
+    pub finding_type: QualityFindingType,
     pub message: String,
 }
 
@@ -121,6 +121,15 @@ pub enum FindingSeverity {
     Info,
     Warning,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityFindingType {
+    AlignmentInconsistent,
+    SpacingInconsistent,
+    LowContrast,
+    MissingHierarchy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,7 +268,7 @@ mod tests {
             score: 0.82,
             findings: vec![QualityFinding {
                 severity: FindingSeverity::Warning,
-                finding_type: "typography".to_string(),
+                finding_type: QualityFindingType::AlignmentInconsistent,
                 message: "Font weight mismatch".to_string(),
             }],
         });
@@ -268,6 +277,7 @@ mod tests {
         assert!(json.contains("\"mode\":\"quality\""));
         assert!(json.contains("\"score\":0.82"));
         assert!(json.contains("\"severity\":\"warning\""));
+        assert!(json.contains("\"type\":\"alignment_inconsistent\""));
     }
 
     #[test]
