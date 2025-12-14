@@ -150,9 +150,10 @@ fn compare_pretty_exits_zero_for_matching_images() {
     ]);
 
     assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.stderr.is_empty(),
-        "stderr should be empty on success"
+        stderr.contains("Artifacts directory:"),
+        "stderr should surface artifact directory on success"
     );
     let pretty = parse_pretty(&output.stdout);
     assert_eq!(pretty.get("mode").and_then(|v| v.as_str()), Some("compare"));

@@ -71,8 +71,8 @@ fn run_metrics_executes_only_selected_metrics() {
         Box::new(StubMetric::layout(0.7, layout_calls.clone())),
     ];
 
-    let scores = run_metrics(&metrics, &[MetricKind::Pixel], &ref_view, &impl_view)
-        .expect("should succeed");
+    let scores =
+        run_metrics(&metrics, &[MetricKind::Pixel], &ref_view, &impl_view).expect("should succeed");
 
     assert_eq!(*pixel_calls.borrow(), 1);
     assert_eq!(*layout_calls.borrow(), 0, "layout metric should be skipped");
@@ -87,8 +87,8 @@ fn run_metrics_returns_scores_for_selected_metric() {
     let metrics: Vec<Box<dyn Metric>> =
         vec![Box::new(StubMetric::pixel(0.92, Rc::new(RefCell::new(0))))];
 
-    let scores = run_metrics(&metrics, &[MetricKind::Pixel], &ref_view, &impl_view)
-        .expect("should succeed");
+    let scores =
+        run_metrics(&metrics, &[MetricKind::Pixel], &ref_view, &impl_view).expect("should succeed");
 
     let pixel = scores.pixel.expect("pixel metric should be present");
     assert_eq!(pixel.score, 0.92);
@@ -106,8 +106,8 @@ fn run_metrics_skips_structural_when_no_structure() {
     let impl_view = view_from_file(impl_img.path(), 4, 4);
     let metrics = default_metrics();
 
-    let scores = run_metrics(&metrics, &[], &ref_view, &impl_view)
-        .expect("should skip structural metrics");
+    let scores =
+        run_metrics(&metrics, &[], &ref_view, &impl_view).expect("should skip structural metrics");
 
     assert!(scores.pixel.is_some());
     assert!(scores.color.is_some());
@@ -717,8 +717,7 @@ fn content_metric_missing_and_extra_text_affect_score() {
     };
     assert!(content.score < 1.0);
     assert!(
-        content.extra_text.iter().any(|t| t.contains("extra"))
-            || !content.extra_text.is_empty()
+        content.extra_text.iter().any(|t| t.contains("extra")) || !content.extra_text.is_empty()
     );
 }
 
@@ -986,6 +985,7 @@ impl StubMetric {
                 missing_text: vec![],
                 extra_text: vec![],
             }),
+            MetricKind::Hierarchy => todo!(), // Should not be called by StubMetric
         }
     }
 }
@@ -1072,4 +1072,215 @@ fn cluster_diff_regions_returns_empty_for_zero_dimensions() {
     assert!(cluster_diff_regions(&diff_map, 8, 0, 4, &thresholds).is_empty());
     assert!(cluster_diff_regions(&diff_map, 8, 8, 0, &thresholds).is_empty());
     assert!(cluster_diff_regions(&[], 8, 8, 4, &thresholds).is_empty());
+}
+
+
+// Hierarchy Heuristic Tests
+#[cfg(test)]
+mod hierarchy_tests {
+    use std::collections::HashMap;
+
+    use crate::{
+        metrics::{
+            hierarchy::{HierarchyHeuristic, HierarchyIssue},
+            Metric,
+        },
+        types::{
+            core::{NormalizedView, BoundingBox},
+            dom::{DomNode, DomSnapshot, ComputedStyle},
+            figma::{FigmaNode, FigmaSnapshot, Typography},
+            metric_results::{HierarchyMetric, MetricResult},
+        },
+    };
+
+    fn create_mock_dom_node(font_size: &str, text_content: &str) -> DomNode {
+        let mut computed_style = HashMap::new();
+        computed_style.insert("font-size".to_string(), font_size.to_string());
+        DomNode {
+            node_id: "test_id".to_string(),
+            node_type: "text".to_string(),
+            tag_name: None,
+            text: Some(text_content.to_string()),
+            bounding_box: BoundingBox::new(0.0, 0.0, 10.0, 10.0),
+            children: Vec::new(),
+            attributes: HashMap::new(),
+            computed_style: Some(computed_style),
+        }
+    }
+
+    fn create_mock_figma_node(font_size: f64, text_content: &str) -> FigmaNode {
+        FigmaNode {
+            id: "test_id".to_string(),
+            name: "test_node".to_string(),
+            node_type: "TEXT".to_string(),
+            bounding_box: BoundingBox::new(0.0, 0.0, 10.0, 10.0),
+            children: None,
+            text_content: Some(text_content.to_string()),
+            typography: Some(Typography {
+                font_size: Some(font_size),
+                font_family: Some("Roboto".to_string()),
+                font_weight: Some(400.0),
+                line_height_px: Some(16.0),
+                line_height_percent: Some(100.0),
+                line_height_unit: Some("PIXELS".to_string()),
+                text_align_horizontal: Some("CENTER".to_string()),
+                text_align_vertical: Some("TOP".to_string()),
+                text_auto_resize: Some("HEIGHT".to_string()),
+                paragraph_indent: Some(0.0),
+                paragraph_spacing: Some(0.0),
+                list_spacing: Some(0.0),
+                text_case: Some("ORIGINAL".to_string()),
+                text_decoration: Some("NONE".to_string()),
+                letter_spacing: Some(0.0),
+                fills: None,
+                hyperlink: None,
+                opentype_flags: None,
+                line_height_percent_font: None,
+            }),
+            raw_node: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn test_hierarchy_heuristic_dom_too_few_tiers() {
+        let dom_snapshot = DomSnapshot {
+            url: "http://example.com".to_string(),
+            html: "<html><body>...</body></html>".to_string(),
+            nodes: vec![
+                create_mock_dom_node("16px", "Body Text 1"),
+                create_mock_dom_node("16px", "Body Text 2"),
+                create_mock_dom_node("18px", "Subtitle"), // Close enough to 16px to be grouped
+            ],
+            viewport_width: 1440.0,
+            viewport_height: 900.0,
+        };
+
+        let impl_view = NormalizedView {
+            dom_snapshot: Some(dom_snapshot),
+            figma_snapshot: None,
+            image_data: None,
+            viewport: crate::types::core::Viewport {
+                width: 1440,
+                height: 900,
+            },
+        };
+
+        let heuristic = HierarchyHeuristic::default();
+        let result = heuristic.compute(&impl_view, &impl_view); // Ref view not used for this metric
+
+        if let MetricResult::Hierarchy(hierarchy_metric) = result {
+            assert!(hierarchy_metric.score < 1.0);
+            assert_eq!(hierarchy_metric.tier_count, 1); // Only one tier due to tolerance
+            assert!(hierarchy_metric
+                .issues
+                .contains(&HierarchyIssue::TooFewTiers(1)));
+        } else {
+            panic!("Expected HierarchyMetric result");
+        }
+    }
+
+    #[test]
+    fn test_hierarchy_heuristic_dom_optimal_tiers() {
+        let dom_snapshot = DomSnapshot {
+            url: "http://example.com".to_string(),
+            html: "<html><body>...</body></html>".to_string(),
+            nodes: vec![
+                create_mock_dom_node("16px", "Body Text"),
+                create_mock_dom_node("24px", "Heading 2"),
+                create_mock_dom_node("36px", "Heading 1"),
+            ],
+            viewport_width: 1440.0,
+            viewport_height: 900.0,
+        };
+
+        let impl_view = NormalizedView {
+            dom_snapshot: Some(dom_snapshot),
+            figma_snapshot: None,
+            image_data: None,
+            viewport: crate::types::core::Viewport {
+                width: 1440,
+                height: 900,
+            },
+        };
+
+        let heuristic = HierarchyHeuristic::default();
+        let result = heuristic.compute(&impl_view, &impl_view);
+
+        if let MetricResult::Hierarchy(hierarchy_metric) = result {
+            assert_eq!(hierarchy_metric.score, 1.0);
+            assert_eq!(hierarchy_metric.tier_count, 3); // 3 distinct tiers
+            assert!(hierarchy_metric.issues.is_empty());
+        } else {
+            panic!("Expected HierarchyMetric result");
+        }
+    }
+
+    #[test]
+    fn test_hierarchy_heuristic_figma_too_many_tiers() {
+        let figma_snapshot = FigmaSnapshot {
+            document_id: "doc1".to_string(),
+            name: "Page 1".to_string(),
+            last_modified: "today".to_string(),
+            thumbnail_url: "url".to_string(),
+            version: "1".to_string(),
+            nodes: vec![
+                create_mock_figma_node(12.0, "Small Text"),
+                create_mock_figma_node(14.0, "Caption"),
+                create_mock_figma_node(16.0, "Body"),
+                create_mock_figma_node(20.0, "Subheading"),
+                create_mock_figma_node(24.0, "Heading"),
+                create_mock_figma_node(30.0, "Large Heading"),
+                create_mock_figma_node(36.0, "Extra Large Heading"),
+            ],
+        };
+
+        let impl_view = NormalizedView {
+            dom_snapshot: None,
+            figma_snapshot: Some(figma_snapshot),
+            image_data: None,
+            viewport: crate::types::core::Viewport {
+                width: 1440,
+                height: 900,
+            },
+        };
+
+        let heuristic = HierarchyHeuristic::default();
+        let result = heuristic.compute(&impl_view, &impl_view);
+
+        if let MetricResult::Hierarchy(hierarchy_metric) = result {
+            assert!(hierarchy_metric.score < 1.0);
+            assert!(hierarchy_metric.tier_count > heuristic.max_tiers); // Many tiers
+            assert!(hierarchy_metric
+                .issues
+                .contains(&HierarchyIssue::TooManyTiers(hierarchy_metric.tier_count)));
+        } else {
+            panic!("Expected HierarchyMetric result");
+        }
+    }
+
+    #[test]
+    fn test_hierarchy_heuristic_empty_view() {
+        let impl_view = NormalizedView {
+            dom_snapshot: None,
+            figma_snapshot: None,
+            image_data: None,
+            viewport: crate::types::core::Viewport {
+                width: 1440,
+                height: 900,
+            },
+        };
+
+        let heuristic = HierarchyHeuristic::default();
+        let result = heuristic.compute(&impl_view, &impl_view);
+
+        if let MetricResult::Hierarchy(hierarchy_metric) = result {
+            assert_eq!(hierarchy_metric.score, 0.0); // Or some other appropriate score for no text
+            assert_eq!(hierarchy_metric.tier_count, 0);
+            assert!(hierarchy_metric
+                .issues
+                .contains(&HierarchyIssue::TooFewTiers(0)));
+        } else {
+            panic!("Expected HierarchyMetric result");
+        }
+    }
 }

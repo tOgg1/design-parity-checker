@@ -249,9 +249,23 @@ fn image_inputs_emit_json_and_pass() {
                     .map_or(false, |s| !s.top_issues.is_empty()),
                 "summary should include top issues"
             );
+            let artifacts = out
+                .artifacts
+                .as_ref()
+                .expect("artifacts block should be present by default");
+            assert!(
+                !artifacts.kept,
+                "default runs should mark artifacts as not kept"
+            );
         }
         other => panic!("expected compare output, got {:?}", other),
     }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Artifacts directory:"),
+        "stderr should point to artifacts directory for visibility"
+    );
 }
 
 #[test]
@@ -289,9 +303,23 @@ fn image_inputs_fail_when_below_threshold() {
                 out.similarity,
                 out.threshold
             );
+            let artifacts = out
+                .artifacts
+                .as_ref()
+                .expect("artifacts block should be present on failure");
+            assert!(
+                !artifacts.kept,
+                "artifacts should not be retained unless explicitly requested"
+            );
         }
         other => panic!("expected compare output, got {:?}", other),
     }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Artifacts directory:"),
+        "stderr should call out artifact directory even when compare fails"
+    );
 }
 
 #[test]
@@ -439,14 +467,22 @@ fn pretty_output_serializes_and_marks_status() {
 
     let pretty = parse_pretty(&output.stdout);
     assert!(
-        output.stderr.is_empty(),
-        "pretty success should not write to stderr"
+        String::from_utf8_lossy(&output.stderr).contains("Artifacts directory:"),
+        "pretty success should log artifact directory"
     );
     assert_eq!(pretty.get("mode").and_then(|v| v.as_str()), Some("compare"));
     assert_eq!(
         pretty.get("passed").and_then(|v| v.as_bool()),
         Some(true),
         "pretty output should indicate pass status, got {pretty}"
+    );
+    assert_eq!(
+        pretty
+            .get("artifacts")
+            .and_then(|a| a.get("kept"))
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "pretty output should include artifacts metadata with kept=false by default"
     );
 }
 
