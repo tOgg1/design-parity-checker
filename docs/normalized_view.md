@@ -16,7 +16,7 @@ This doc describes how inputs become a `NormalizedView`, what fields exist, and 
 - `ocr_blocks`: Reserved for future OCR (currently unused).
 
 ## Where artifacts go
-- Compare writes to `tmp/dpc-<pid>/` by default: `ref_screenshot.png`, `impl_screenshot.png`, DOM snapshots, and Figma exports.
+- Compare writes under the OS temp dir as `dpc-<pid>-<timestamp>/` by default (e.g., `/tmp/dpc-1234-1700000000000/`): `ref_screenshot.png`, `impl_screenshot.png`, DOM snapshots, and Figma exports.
 - `--keep-artifacts` retains the directory; otherwise it is cleaned up after compare.
 - Mocking (offline/CI): `DPC_MOCK_RENDER_REF` / `DPC_MOCK_RENDER_IMPL` PNGs, or `DPC_MOCK_RENDERERS_DIR=/path` with `ref.png` / `impl.png` (applies to URL/Figma kinds).
 

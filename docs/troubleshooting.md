@@ -23,5 +23,5 @@ Common issues and quick fixes when running DPC locally or in CI.
 - Exit 2: config/network/runtime errors (treat as infra issues).
 
 ## Keeping artifacts for debugging
-- By default, artifacts go under `/tmp/dpc-<pid>/` and are cleaned up.
-- Use `--keep-artifacts` and upload the directory in CI for investigation.
+- By default, artifacts go under the OS temp dir as `dpc-<pid>-<timestamp>/` (e.g., `/tmp/dpc-1234-1700000000000/`) and are cleaned up.
+- Use `--keep-artifacts` (or `--artifacts-dir`) and upload the directory in CI for investigation.

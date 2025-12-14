@@ -26,7 +26,7 @@ cargo test --all-targets      # runs unit + integration tests
 - In CI, ensure Chromium is available or use the mock render env vars to avoid real browser calls.
 
 ## Artifacts and paths
-- Temporary artifacts (screenshots/DOM) are written under `/tmp/dpc-<pid>/` unless `--keep-artifacts` is passed with a custom path.
+- Temporary artifacts (screenshots/DOM) are written under the OS temp dir as `dpc-<pid>-<timestamp>/` (e.g., `/tmp/dpc-1234-1700000000000/`) unless `--keep-artifacts` is passed with a custom path.
 - Normalized screenshots for image inputs are saved where you point the output path; parent directories are created automatically.
 
 ## Common issues

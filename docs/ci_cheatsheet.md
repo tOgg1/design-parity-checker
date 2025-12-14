@@ -20,8 +20,9 @@ Quick reference for running and interpreting the CI steps, with tips for local d
 - Playwright: real URL rendering needs Node + `npx playwright install chromium`. Mocks bypass the browser.
 
 ## Artifacts
-- Compare writes temp artifacts under `/tmp/dpc-<pid>/` by default (screenshots/DOM/figma exports).
-- Use `--keep-artifacts` to retain and upload in CI for debugging; otherwise they are cleaned up.
+- Compare writes temp artifacts under the OS temp dir as `dpc-<pid>-<timestamp>/` (e.g., `/tmp/dpc-1234-1700000000000/`) by default (screenshots/DOM/Figma exports).
+- Use `--keep-artifacts` or `--artifacts-dir` to retain and upload in CI for debugging; otherwise they are cleaned up.
+- Output includes an `artifacts` block with the directory and file paths (screenshots, DOM/Figma snapshots, optional `diff_heatmap.png`) when artifacts are kept.
 
 ## Local dry-run tips
 - Run `cargo test --test compare_integration` to validate exit codes and output shapes. With mocks set, no browser/Figma calls occur.

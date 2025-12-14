@@ -32,13 +32,13 @@ This document describes the CLI output contract for all commands. The schema is 
     ]
   },
   "artifacts": {
-    "directory": "/tmp/dpc-123",
+    "directory": "/tmp/dpc-1234-1700000000000",
     "kept": true,
-    "refScreenshot": "/tmp/dpc-123/ref_screenshot.png",
-    "implScreenshot": "/tmp/dpc-123/impl_screenshot.png",
+    "refScreenshot": "/tmp/dpc-1234-1700000000000/ref_screenshot.png",
+    "implScreenshot": "/tmp/dpc-1234-1700000000000/impl_screenshot.png",
     "diffImage": null,
-    "refDomSnapshot": "/tmp/dpc-123/ref_dom.json",
-    "implDomSnapshot": "/tmp/dpc-123/impl_dom.json",
+    "refDomSnapshot": "/tmp/dpc-1234-1700000000000/ref_dom.json",
+    "implDomSnapshot": "/tmp/dpc-1234-1700000000000/impl_dom.json",
     "refFigmaSnapshot": null,
     "implFigmaSnapshot": null
   }
