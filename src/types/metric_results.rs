@@ -36,9 +36,52 @@ pub struct MetricScores {
 pub struct PixelMetric {
     /// Similarity score (0.0 - 1.0)
     pub score: f32,
-    /// Regions where differences were detected
+    /// Regions where differences were detected (clustered)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diff_regions: Vec<PixelDiffRegion>,
+    /// Semantic analysis of diff regions (when vision model is enabled)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_diffs: Option<Vec<SemanticDiff>>,
+}
+
+/// A semantically analyzed diff region.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticDiff {
+    /// Bounding box x (normalized 0.0-1.0)
+    pub x: f32,
+    /// Bounding box y (normalized 0.0-1.0)
+    pub y: f32,
+    /// Bounding box width (normalized 0.0-1.0)
+    pub width: f32,
+    /// Bounding box height (normalized 0.0-1.0)
+    pub height: f32,
+    /// Severity of the difference
+    pub severity: DiffSeverity,
+    /// Type of semantic difference
+    pub diff_type: SemanticDiffType,
+    /// Human-readable description of the difference
+    pub description: String,
+    /// Confidence score (0.0-1.0) from the vision model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+}
+
+/// Type of semantic difference detected by vision analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDiffType {
+    TextContent,
+    TextReflow,
+    Typography,
+    Layout,
+    Color,
+    MissingElement,
+    ExtraElement,
+    Spacing,
+    ImageChange,
+    Decoration,
+    Other,
 }
 
 /// A region of pixel differences.
@@ -57,6 +100,10 @@ pub struct PixelDiffRegion {
     pub severity: DiffSeverity,
     /// Why this difference was flagged
     pub reason: PixelDiffReason,
+    /// Average pixel difference intensity (0.0 - 1.0) in this region.
+    /// Higher values indicate more significant visual differences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity: Option<f32>,
 }
 
 /// Severity level of a difference.

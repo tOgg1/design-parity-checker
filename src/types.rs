@@ -24,5 +24,5 @@ pub use figma::{FigmaNode, FigmaPaint, FigmaPaintKind, FigmaSnapshot};
 pub use metric_results::{
     ColorDiff, ColorDiffKind, ColorMetric, ContentMetric, DiffSeverity, LayoutDiffKind,
     LayoutDiffRegion, LayoutMetric, MetricScores, PixelDiffReason, PixelDiffRegion, PixelMetric,
-    TypographyDiff, TypographyIssue, TypographyMetric,
+    SemanticDiff, SemanticDiffType, TypographyDiff, TypographyIssue, TypographyMetric,
 };
