@@ -17,17 +17,25 @@ name = "dpc_lib"
 path = "src/lib.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-image = "0.25"
+# Async + HTTP
 tokio = { version = "1", features = ["full"] }
-thiserror = "2"
-anyhow = "1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.11", features = ["json", "gzip", "brotli", "cookies", "stream"] }
 url = "2"
+thiserror = "1.0"
+# Images and colors
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico", "bmp", "tga", "tiff", "hdr", "dds"] }
 palette = "0.7"
-playwright = "0.0.20"
+# CLI / parsing
+clap = { version = "4.5", features = ["derive"] }
+serde_yaml = "0.9"
+# Headless
+playwright = { version = "0.2", package = "chromiumoxide", optional = true }
+futures = "0.3"
+tokio-util = "0.7"
+toml = "0.8"
+humantime-serde = "1.1"
 
 [dev-dependencies]
 tempfile = "3"
