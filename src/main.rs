@@ -36,7 +36,8 @@ async fn run() -> ExitCode {
             nav_timeout,
             network_idle_timeout,
             process_timeout,
-            ..
+            semantic_analysis,
+            context,
         } => {
             run_compare(
                 &raw_args,
@@ -58,6 +59,8 @@ async fn run() -> ExitCode {
                 nav_timeout,
                 network_idle_timeout,
                 process_timeout,
+                semantic_analysis,
+                context,
             )
             .await
         }

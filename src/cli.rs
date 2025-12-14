@@ -117,6 +117,19 @@ pub enum Commands {
             help = "Process timeout (seconds) for Playwright invocation"
         )]
         process_timeout: u64,
+
+        #[arg(
+            long,
+            help = "Enable semantic analysis of diff regions using a vision model (requires DPC_VISION_API_KEY or OPENAI_API_KEY)"
+        )]
+        semantic_analysis: bool,
+
+        #[arg(
+            long,
+            help = "Context description for semantic analysis (e.g., 'Home alarm signup page with partner logos')",
+            value_name = "TEXT"
+        )]
+        context: Option<String>,
     },
 
     /// Generate HTML/Tailwind code from a design input
@@ -230,6 +243,7 @@ mod tests {
                 nav_timeout,
                 network_idle_timeout,
                 process_timeout,
+                ..
             } => {
                 assert_eq!(r#ref, "https://example.com/design");
                 assert_eq!(r#impl, "https://example.com/build");
