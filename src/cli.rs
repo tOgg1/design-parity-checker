@@ -6,7 +6,8 @@ use std::path::PathBuf;
 #[command(name = "dpc")]
 #[command(
     version,
-    about = "Design Parity Checker - Compare implementations against design references"
+    about = "Design Parity Checker - Compare implementations against design references",
+    long_about = "Design Parity Checker (DPC)\n\nModes:\n- compare: measure similarity between a reference (Figma/URL/image) and an implementation (Figma/URL/image).\n- generate-code: stub for future code generation.\n- quality: experimental reference-free scoring.\n\nUse --help on any subcommand for details."
 )]
 #[command(propagate_version = true)]
 pub struct Cli {
@@ -15,6 +16,14 @@ pub struct Cli {
 
     #[arg(long, global = true, help = "Enable verbose output")]
     pub verbose: bool,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Optional config file (TOML) to set defaults for viewport/threshold/weights/timeouts"
+    )]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -46,7 +55,7 @@ pub enum Commands {
         #[arg(
             long,
             default_value = "0.95",
-            help = "Similarity threshold for pass/fail"
+            help = "Similarity threshold for pass/fail (similarity >= threshold passes)"
         )]
         threshold: f64,
 
@@ -57,10 +66,16 @@ pub enum Commands {
         )]
         metrics: Option<Vec<String>>,
 
-        #[arg(long, help = "CSS selectors to ignore in DOM comparisons")]
+        #[arg(
+            long,
+            help = "CSS selectors to ignore in DOM comparisons (comma-separated; supports #id, .class, tag)"
+        )]
         ignore_selectors: Option<String>,
 
-        #[arg(long, help = "Path to JSON file with regions to ignore")]
+        #[arg(
+            long,
+            help = "Path to JSON array of {x,y,width,height} regions to mask before metrics (values can be px or 0-1 normalized)"
+        )]
         ignore_regions: Option<PathBuf>,
 
         #[arg(long, value_enum, default_value = "json", help = "Output format")]
@@ -71,9 +86,37 @@ pub enum Commands {
 
         #[arg(
             long,
-            help = "Keep intermediate artifacts (screenshots, DOM snapshots)"
+            help = "Keep intermediate artifacts (screenshots, DOM snapshots); otherwise cleaned up"
         )]
         keep_artifacts: bool,
+
+        #[arg(
+            long,
+            help = "Directory to store artifacts (implies --keep-artifacts); created if missing",
+            value_name = "PATH"
+        )]
+        artifacts_dir: Option<PathBuf>,
+
+        #[arg(
+            long,
+            default_value = "30",
+            help = "Navigation timeout (seconds) for URL rendering"
+        )]
+        nav_timeout: u64,
+
+        #[arg(
+            long,
+            default_value = "10",
+            help = "Network idle timeout (seconds) for URL rendering"
+        )]
+        network_idle_timeout: u64,
+
+        #[arg(
+            long,
+            default_value = "45",
+            help = "Process timeout (seconds) for Playwright invocation"
+        )]
+        process_timeout: u64,
     },
 
     /// Generate HTML/Tailwind code from a design input
@@ -84,14 +127,25 @@ pub enum Commands {
         #[arg(long, value_enum, help = "Override type detection for input")]
         input_type: Option<ResourceType>,
 
-        #[arg(long, default_value = "html+tailwind", help = "Output stack")]
+        #[arg(
+            long,
+            default_value = "html+tailwind",
+            help = "Output stack (e.g., html+tailwind)"
+        )]
         stack: String,
 
-        #[arg(long, default_value = "1440x900", help = "Viewport dimensions")]
+        #[arg(
+            long,
+            default_value = "1440x900",
+            help = "Viewport dimensions (WIDTHxHEIGHT)"
+        )]
         viewport: Viewport,
 
         #[arg(long, short, help = "Output file path")]
         output: Option<PathBuf>,
+
+        #[arg(long, value_enum, default_value = "json", help = "Output format")]
+        format: OutputFormat,
     },
 
     /// Compute reference-free design quality score (experimental)
@@ -102,7 +156,11 @@ pub enum Commands {
         #[arg(long, value_enum, help = "Override type detection for input")]
         input_type: Option<ResourceType>,
 
-        #[arg(long, default_value = "1440x900", help = "Viewport dimensions")]
+        #[arg(
+            long,
+            default_value = "1440x900",
+            help = "Viewport dimensions (WIDTHxHEIGHT)"
+        )]
         viewport: Viewport,
 
         #[arg(long, short, help = "Output file path")]
@@ -148,6 +206,7 @@ mod tests {
         ]);
 
         assert!(!cli.verbose);
+        assert!(cli.config.is_none());
 
         match cli.command {
             Commands::Compare {
@@ -163,6 +222,10 @@ mod tests {
                 ignore_selectors,
                 ignore_regions,
                 keep_artifacts,
+                artifacts_dir,
+                nav_timeout,
+                network_idle_timeout,
+                process_timeout,
             } => {
                 assert_eq!(r#ref, "https://example.com/design");
                 assert_eq!(r#impl, "https://example.com/build");
@@ -177,6 +240,10 @@ mod tests {
                 assert!(ignore_selectors.is_none());
                 assert!(ignore_regions.is_none());
                 assert!(!keep_artifacts);
+                assert!(artifacts_dir.is_none());
+                assert_eq!(nav_timeout, 30);
+                assert_eq!(network_idle_timeout, 10);
+                assert_eq!(process_timeout, 45);
             }
             _ => panic!("expected compare command"),
         }
@@ -210,6 +277,16 @@ mod tests {
             "--ignore-regions",
             "regions.json",
             "--keep-artifacts",
+            "--artifacts-dir",
+            "artifacts",
+            "--nav-timeout",
+            "20",
+            "--network-idle-timeout",
+            "6",
+            "--process-timeout",
+            "50",
+            "--config",
+            "dpc.toml",
         ]);
 
         match cli.command {
@@ -224,6 +301,10 @@ mod tests {
                 ignore_selectors,
                 ignore_regions,
                 keep_artifacts,
+                artifacts_dir,
+                nav_timeout,
+                network_idle_timeout,
+                process_timeout,
                 ..
             } => {
                 assert!(matches!(ref_type, Some(ResourceType::Image)));
@@ -243,6 +324,13 @@ mod tests {
                     Some(std::path::Path::new("regions.json"))
                 );
                 assert!(keep_artifacts);
+                assert_eq!(
+                    artifacts_dir.as_deref(),
+                    Some(std::path::Path::new("artifacts"))
+                );
+                assert_eq!(nav_timeout, 20);
+                assert_eq!(network_idle_timeout, 6);
+                assert_eq!(process_timeout, 50);
             }
             _ => panic!("expected compare command with overrides"),
         }
