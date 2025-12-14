@@ -58,6 +58,159 @@ fn compare_accepts_config_flag_and_still_passes() {
 }
 
 #[test]
+fn compare_uses_config_defaults_when_flags_absent() {
+    let dir = TempDir::new().expect("tempdir");
+    let ref_path = dir.path().join("ref.png");
+    let impl_path = dir.path().join("impl.png");
+    let cfg_path = dir.path().join("dpc.toml");
+    write_image(&ref_path, [0, 0, 0, 255]);
+    write_image(&impl_path, [255, 255, 255, 255]);
+    std::fs::write(
+        &cfg_path,
+        r#"
+threshold = 0.0
+viewport = "800x600"
+[metric_weights]
+pixel = 0.4
+layout = 0.2
+typography = 0.15
+color = 0.15
+content = 0.1
+[timeouts]
+navigation = "5s"
+network_idle = "3s"
+process = "6s"
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dpc"))
+        .args([
+            "compare",
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--impl",
+            impl_path.to_str().unwrap(),
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run dpc");
+    assert_eq!(output.status.code(), Some(0));
+    let body: DpcOutput =
+        serde_json::from_slice(&output.stdout).expect("compare output should be JSON");
+    match body {
+        DpcOutput::Compare(out) => {
+            assert_eq!(out.viewport.width, 800);
+            assert_eq!(out.viewport.height, 600);
+            assert!((out.threshold - 0.0).abs() < f32::EPSILON);
+            assert!(out.passed, "expected compare to pass with config threshold");
+        }
+        other => panic!("expected compare output, got {:?}", other),
+    }
+}
+
+#[test]
+fn compare_reports_invalid_config_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let ref_path = dir.path().join("ref.png");
+    let impl_path = dir.path().join("impl.png");
+    let cfg_path = dir.path().join("dpc.toml");
+    write_image(&ref_path, [10, 10, 10, 255]);
+    write_image(&impl_path, [20, 20, 20, 255]);
+    std::fs::write(&cfg_path, r#"viewport = "not-a-viewport""#).expect("write bad config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dpc"))
+        .args([
+            "compare",
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--impl",
+            impl_path.to_str().unwrap(),
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run dpc");
+
+    assert_eq!(output.status.code(), Some(2));
+    let err: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout JSON for invalid config");
+    assert_eq!(
+        err.get("error")
+            .and_then(|e| e.get("category"))
+            .and_then(|v| v.as_str()),
+        Some("config")
+    );
+    let msg = err
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        msg.contains("viewport"),
+        "expected viewport parse error, got {msg}"
+    );
+}
+
+#[test]
+fn compare_cli_flags_override_config_values() {
+    let dir = TempDir::new().expect("tempdir");
+    let ref_path = dir.path().join("ref.png");
+    let impl_path = dir.path().join("impl.png");
+    let cfg_path = dir.path().join("dpc.toml");
+    write_image(&ref_path, [5, 5, 5, 255]);
+    write_image(&impl_path, [5, 5, 5, 255]);
+    std::fs::write(
+        &cfg_path,
+        r#"
+threshold = 0.99
+viewport = "800x600"
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dpc"))
+        .args([
+            "compare",
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--impl",
+            impl_path.to_str().unwrap(),
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--threshold",
+            "0.5",
+            "--viewport",
+            "1024x768",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run dpc");
+
+    assert_eq!(output.status.code(), Some(0));
+    let body: DpcOutput =
+        serde_json::from_slice(&output.stdout).expect("compare output should be JSON");
+    match body {
+        DpcOutput::Compare(out) => {
+            assert_eq!(out.viewport.width, 1024);
+            assert_eq!(out.viewport.height, 768);
+            assert!(
+                (out.threshold - 0.5).abs() < f32::EPSILON,
+                "CLI threshold should override config threshold"
+            );
+        }
+        other => panic!("expected compare output, got {:?}", other),
+    }
+}
+
+#[test]
 fn compare_exit_code_fails_threshold_for_different_images() {
     let dir = TempDir::new().expect("tempdir");
     let ref_path = dir.path().join("ref.png");
@@ -150,9 +303,10 @@ fn compare_pretty_exits_zero_for_matching_images() {
     ]);
 
     assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.stderr.is_empty(),
-        "stderr should be empty on success"
+        stderr.contains("Artifacts directory:"),
+        "stderr should surface artifact directory on success"
     );
     let pretty = parse_pretty(&output.stdout);
     assert_eq!(pretty.get("mode").and_then(|v| v.as_str()), Some("compare"));
@@ -329,12 +483,14 @@ fn compare_figma_without_node_id_reports_config_error_and_hint() {
 }
 
 #[test]
-fn generate_code_stub_exits_zero() {
+fn generate_code_emits_code_and_exits_zero() {
     let dir = TempDir::new().expect("tempdir");
     let input_path = dir.path().join("input.png");
+    let output_path = dir.path().join("output.html");
     write_image(&input_path, [128, 64, 32, 255]);
 
     let output = Command::new(env!("CARGO_BIN_EXE_dpc"))
+        .env("DPC_MOCK_CODE", "<main>mock</main>")
         .args([
             "generate-code",
             "--input",
@@ -343,6 +499,8 @@ fn generate_code_stub_exits_zero() {
             "html+tailwind",
             "--viewport",
             "800x600",
+            "--output",
+            output_path.to_str().unwrap(),
             "--format",
             "json",
         ])
@@ -355,26 +513,32 @@ fn generate_code_stub_exits_zero() {
     match body {
         DpcOutput::GenerateCode(out) => {
             assert_eq!(out.input.value, input_path.to_string_lossy());
-            let summary = out
-                .summary
-                .and_then(|s| s.top_issues.first().cloned())
-                .unwrap_or_default();
+            assert_eq!(out.output_path.as_deref(), Some(output_path.as_path()));
+            let code = out.code.expect("code should be present");
+            assert_eq!(code, "<main>mock</main>");
+            let notes = out.summary.unwrap().top_issues;
             assert!(
-                summary.to_ascii_lowercase().contains("not implemented"),
-                "expected not-implemented summary, got: {summary}"
+                notes
+                    .iter()
+                    .any(|n| n.to_ascii_lowercase().contains("mock")),
+                "summary should mention mock usage"
             );
+            let written =
+                std::fs::read_to_string(&output_path).expect("code file should be written");
+            assert_eq!(written, code);
         }
         other => panic!("expected generate-code output, got {:?}", other),
     }
 }
 
 #[test]
-fn generate_code_pretty_outputs_stub_message() {
+fn generate_code_pretty_outputs_code() {
     let dir = TempDir::new().expect("tempdir");
     let input_path = dir.path().join("input.png");
     write_image(&input_path, [128, 64, 32, 255]);
 
     let output = Command::new(env!("CARGO_BIN_EXE_dpc"))
+        .env("DPC_MOCK_CODE", "<section>pretty</section>")
         .args([
             "generate-code",
             "--input",
@@ -394,13 +558,14 @@ fn generate_code_pretty_outputs_stub_message() {
         serde_json::from_slice(&output.stdout).expect("pretty output should stay JSON when piped");
     match body {
         DpcOutput::GenerateCode(out) => {
-            let summary = out
-                .summary
-                .and_then(|s| s.top_issues.first().cloned())
-                .unwrap_or_default();
+            let code = out.code.expect("code should be present");
+            assert_eq!(code, "<section>pretty</section>");
+            let notes = out.summary.unwrap().top_issues;
             assert!(
-                summary.to_ascii_lowercase().contains("not implemented"),
-                "expected not-implemented summary, got: {summary}"
+                notes
+                    .iter()
+                    .any(|n| n.to_ascii_lowercase().contains("mock")),
+                "summary should mention mock usage"
             );
         }
         other => panic!("expected generate-code output, got {:?}", other),
@@ -408,7 +573,7 @@ fn generate_code_pretty_outputs_stub_message() {
 }
 
 #[test]
-fn quality_stub_exits_zero() {
+fn quality_command_exits_zero_and_scores() {
     let dir = TempDir::new().expect("tempdir");
     let input_path = dir.path().join("input.png");
     write_image(&input_path, [200, 200, 200, 255]);
@@ -434,14 +599,17 @@ fn quality_stub_exits_zero() {
             assert_eq!(out.input.value, input_path.to_string_lossy());
             assert_eq!(out.viewport.width, 640);
             assert_eq!(out.viewport.height, 480);
-            let first = out
-                .findings
-                .get(0)
-                .map(|f| f.message.clone())
-                .unwrap_or_default();
+            assert!((0.0..=1.0).contains(&out.score));
             assert!(
-                first.to_ascii_lowercase().contains("not implemented"),
-                "expected not-implemented finding, got: {first}"
+                !out.findings.is_empty(),
+                "quality should emit heuristic findings"
+            );
+            assert!(
+                out.findings.iter().any(|f| matches!(
+                    f.finding_type,
+                    dpc_lib::QualityFindingType::MissingHierarchy
+                )),
+                "quality findings should include a missing_hierarchy entry"
             );
         }
         other => panic!("expected quality output, got {:?}", other),
@@ -449,7 +617,7 @@ fn quality_stub_exits_zero() {
 }
 
 #[test]
-fn quality_pretty_outputs_stub_message() {
+fn quality_pretty_outputs_findings() {
     let dir = TempDir::new().expect("tempdir");
     let input_path = dir.path().join("input.png");
     write_image(&input_path, [200, 200, 200, 255]);
@@ -472,14 +640,20 @@ fn quality_pretty_outputs_stub_message() {
         serde_json::from_slice(&output.stdout).expect("pretty output should stay JSON when piped");
     match body {
         DpcOutput::Quality(out) => {
-            let first = out
-                .findings
-                .get(0)
-                .map(|f| f.message.clone())
-                .unwrap_or_default();
+            assert!((0.0..=1.0).contains(&out.score));
             assert!(
-                first.to_ascii_lowercase().contains("not implemented"),
-                "expected not-implemented finding, got: {first}"
+                !out.findings.is_empty(),
+                "pretty quality output should include findings"
+            );
+            assert!(
+                out.findings.iter().any(|f| matches!(
+                    f.finding_type,
+                    dpc_lib::QualityFindingType::AlignmentInconsistent
+                        | dpc_lib::QualityFindingType::SpacingInconsistent
+                        | dpc_lib::QualityFindingType::LowContrast
+                        | dpc_lib::QualityFindingType::MissingHierarchy
+                )),
+                "quality findings should expose typed entries"
             );
         }
         other => panic!("expected quality output, got {:?}", other),

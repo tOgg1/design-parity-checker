@@ -27,43 +27,53 @@ fn run_cmd(args: &[&str]) -> Output {
         .expect("run dpc command")
 }
 
+fn run_cmd_with_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(bin_path());
+    cmd.args(args);
+    for (key, val) in env {
+        cmd.env(key, val);
+    }
+    cmd.output().expect("run dpc command")
+}
+
 fn parse_json(stdout: &[u8]) -> DpcOutput {
     serde_json::from_slice(stdout).expect("output should be valid JSON")
 }
 
 #[test]
-fn generate_code_stub_returns_not_implemented() {
-    let output = run_cmd(&[
-        "generate-code",
-        "--input",
-        asset("ref.png").to_str().unwrap(),
-        "--stack",
-        "html+tailwind",
-        "--format",
-        "json",
-    ]);
+fn generate_code_emits_html() {
+    let output = run_cmd_with_env(
+        &[
+            "generate-code",
+            "--input",
+            asset("ref.png").to_str().unwrap(),
+            "--stack",
+            "html+tailwind",
+            "--format",
+            "json",
+        ],
+        &[("DPC_MOCK_CODE", "<section class=\"mock\">hello</section>")],
+    );
 
     assert!(
         output.status.success(),
-        "generate-code stub should exit 0, got {:?}",
+        "generate-code should exit 0, got {:?}",
         output.status.code()
     );
 
     match parse_json(&output.stdout) {
         DpcOutput::GenerateCode(out) => {
             assert_eq!(out.input.kind, dpc_lib::ResourceKind::Image);
-            assert!(
-                out.summary
-                    .as_ref()
-                    .and_then(|s| s.top_issues.first())
-                    .map_or(false, |t| t
-                        .to_ascii_lowercase()
-                        .contains("not implemented")),
-                "summary.topIssues should include not-implemented note"
+            assert_eq!(
+                out.code.as_deref(),
+                Some("<section class=\"mock\">hello</section>")
             );
+            let notes = out.summary.unwrap().top_issues;
             assert!(
-                out.code.is_none(),
-                "code should be absent/null for stub output"
+                notes
+                    .iter()
+                    .any(|n| n.to_ascii_lowercase().contains("mock")),
+                "summary should note mock usage"
             );
         }
         other => panic!("expected generate-code output, got {:?}", other),
@@ -71,7 +81,7 @@ fn generate_code_stub_returns_not_implemented() {
 }
 
 #[test]
-fn quality_stub_returns_not_implemented() {
+fn quality_command_scores_with_findings() {
     let output = run_cmd(&[
         "quality",
         "--input",
@@ -82,7 +92,7 @@ fn quality_stub_returns_not_implemented() {
 
     assert!(
         output.status.success(),
-        "quality stub should exit 0, got {:?}",
+        "quality command should exit 0, got {:?}",
         output.status.code()
     );
 
@@ -90,18 +100,20 @@ fn quality_stub_returns_not_implemented() {
         DpcOutput::Quality(out) => {
             assert_eq!(out.input.kind, dpc_lib::ResourceKind::Image);
             assert!(
-                !out.findings.is_empty(),
-                "quality stub should emit at least one finding"
+                (0.0..=1.0).contains(&out.score),
+                "score should be normalized, got {}",
+                out.score
             );
-            let first = &out.findings[0];
-            assert_eq!(first.finding_type, "not_implemented");
-            assert!(matches!(first.severity, dpc_lib::FindingSeverity::Info));
             assert!(
-                first
-                    .message
-                    .to_ascii_lowercase()
-                    .contains("not implemented"),
-                "expected not-implemented message in finding"
+                !out.findings.is_empty(),
+                "quality should emit heuristic findings"
+            );
+            assert!(
+                out.findings.iter().any(|f| matches!(
+                    f.finding_type,
+                    dpc_lib::QualityFindingType::MissingHierarchy
+                )),
+                "quality findings should include a missing_hierarchy entry"
             );
         }
         other => panic!("expected quality output, got {:?}", other),

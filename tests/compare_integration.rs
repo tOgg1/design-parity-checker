@@ -109,6 +109,69 @@ fn compare_emits_artifacts_when_keep_artifacts_is_enabled() {
 }
 
 #[test]
+fn compare_reports_artifacts_even_when_not_kept() {
+    let dir = tempdir().expect("tempdir");
+    let ref_path = dir.path().join("ref.png");
+    let impl_path = dir.path().join("impl.png");
+
+    let ref_img: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_pixel(4, 4, Rgba([10, 20, 30, 255]));
+    let impl_img: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_pixel(4, 4, Rgba([10, 20, 30, 255]));
+    ref_img.save(&ref_path).unwrap();
+    impl_img.save(&impl_path).unwrap();
+
+    let output = run_compare(
+        &[
+            "compare",
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--impl",
+            impl_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "--threshold",
+            "0.9",
+        ],
+        &[],
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Artifacts directory"),
+        "stderr should include artifact directory path"
+    );
+
+    match parse_output(&output.stdout) {
+        DpcOutput::Compare(out) => {
+            let artifacts = out
+                .artifacts
+                .expect("artifacts block should be present even when not kept");
+            assert!(
+                !artifacts.kept,
+                "kept should be false when --keep-artifacts is not set"
+            );
+            assert!(
+                !artifacts.directory.as_os_str().is_empty(),
+                "artifacts directory should be populated"
+            );
+            assert!(
+                artifacts.ref_screenshot.is_some(),
+                "ref screenshot path should be present"
+            );
+            assert!(
+                artifacts.impl_screenshot.is_some(),
+                "impl screenshot path should be present"
+            );
+            assert!(
+                artifacts.diff_image.is_none(),
+                "diff heatmap should not be generated when artifacts are not kept"
+            );
+        }
+        other => panic!("expected compare output, got {:?}", other),
+    }
+}
+
+#[test]
 fn ignore_regions_masks_pixel_differences() {
     let dir = tempdir().expect("tempdir");
     let ref_path = dir.path().join("ref.png");
@@ -438,9 +501,10 @@ fn pretty_output_serializes_and_marks_status() {
     );
 
     let pretty = parse_pretty(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.stderr.is_empty(),
-        "pretty success should not write to stderr"
+        stderr.is_empty() || stderr.contains("Artifacts directory"),
+        "unexpected stderr on success: {stderr}"
     );
     assert_eq!(pretty.get("mode").and_then(|v| v.as_str()), Some("compare"));
     assert_eq!(
