@@ -1,13 +1,19 @@
 use std::fs;
 use std::path::Path;
+use std::str::FromStr;
 use std::time::Duration;
 
 use crate::Viewport;
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    #[serde(
+        default = "Viewport::default",
+        deserialize_with = "deserialize_viewport"
+    )]
     pub viewport: Viewport,
     pub threshold: f64,
     pub metric_weights: MetricWeights,
@@ -69,6 +75,30 @@ impl Default for Config {
     }
 }
 
+fn deserialize_viewport<'de, D>(deserializer: D) -> Result<Viewport, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ViewportToml {
+        String(String),
+        Table { width: u32, height: u32 },
+    }
+
+    match ViewportToml::deserialize(deserializer)? {
+        ViewportToml::String(s) => Viewport::from_str(&s).map_err(de::Error::custom),
+        ViewportToml::Table { width, height } => {
+            if width == 0 || height == 0 {
+                return Err(de::Error::custom(
+                    "viewport width and height must be greater than zero",
+                ));
+            }
+            Ok(Viewport { width, height })
+        }
+    }
+}
+
 impl Config {
     /// Load configuration from a TOML file. Missing fields fall back to defaults.
     pub fn from_toml_file(path: &Path) -> Result<Self, std::io::Error> {
@@ -82,7 +112,7 @@ impl Config {
     /// Ensure defaults are applied when deserializing partial configs.
     fn apply_defaults(&mut self) {
         let defaults = Config::default();
-        if self.threshold <= 0.0 {
+        if self.threshold < 0.0 {
             self.threshold = defaults.threshold;
         }
         self.metric_weights = MetricWeights {
@@ -151,6 +181,9 @@ impl Config {
             || self.timeouts.process.is_zero()
         {
             return Err("timeouts must be greater than zero seconds".to_string());
+        }
+        if self.viewport.width == 0 || self.viewport.height == 0 {
+            return Err("viewport width and height must be greater than zero".to_string());
         }
         Ok(())
     }
@@ -250,5 +283,44 @@ process = "55s"
         assert_eq!(cfg.timeouts.navigation, Duration::from_secs(20));
         assert_eq!(cfg.timeouts.network_idle, Duration::from_secs(5));
         assert_eq!(cfg.timeouts.process, Duration::from_secs(55));
+    }
+
+    #[test]
+    fn load_from_toml_accepts_viewport_string() {
+        let tmp = tempfile::Builder::new()
+            .suffix(".toml")
+            .tempfile()
+            .expect("temp file");
+        std::fs::write(
+            tmp.path(),
+            r#"
+viewport = "1024x768"
+threshold = 0.8
+[timeouts]
+navigation = "10s"
+network_idle = "5s"
+process = "15s"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::from_toml_file(tmp.path()).expect("load config");
+        assert_eq!(cfg.viewport.width, 1024);
+        assert_eq!(cfg.viewport.height, 768);
+        assert!((cfg.threshold - 0.8).abs() < f64::EPSILON);
+        assert_eq!(cfg.timeouts.navigation, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn validate_rejects_zero_viewport_dimensions() {
+        let cfg = Config {
+            viewport: Viewport {
+                width: 0,
+                height: 0,
+            },
+            ..Config::default()
+        };
+
+        assert!(cfg.validate().is_err());
     }
 }

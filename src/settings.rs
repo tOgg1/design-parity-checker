@@ -100,8 +100,12 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, DpcError> {
         Config::default()
     };
 
-    cfg.validate()
-        .map_err(|e| DpcError::Config(format!("Invalid config: {}", e)))?;
+    cfg.validate().map_err(|e| {
+        let prefix = path
+            .map(|p| format!("Invalid config ({}): {}", p.display(), e))
+            .unwrap_or_else(|| format!("Invalid config: {}", e));
+        DpcError::Config(prefix)
+    })?;
     Ok(cfg)
 }
 
