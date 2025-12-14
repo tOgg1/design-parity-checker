@@ -1,20 +1,41 @@
+//! Metrics module for comparing reference and implementation views.
+//!
+//! This module provides a unified interface for computing various design parity metrics:
+//! - Pixel/perceptual similarity (SSIM-based)
+//! - Layout/structure similarity (element matching)
+//! - Typography similarity (font properties)
+//! - Color palette similarity (k-means clustering)
+//! - Content similarity (text matching)
+
 use crate::error::DpcError;
 use crate::types::{
-    ColorDiff, ColorDiffKind, ColorMetric, ContentMetric, DiffSeverity, LayoutDiffKind,
-    LayoutDiffRegion, LayoutMetric, MetricScores, NormalizedView, PixelMetric, TypographyDiff,
-    TypographyIssue, TypographyMetric,
+    ColorMetric, ContentMetric, LayoutMetric, MetricScores, NormalizedView, PixelMetric,
+    TypographyMetric,
 };
 use crate::Result;
-use image::{DynamicImage, GenericImageView};
-use palette::{convert::FromColorUnclamped, Lab, Srgb};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
+// Submodules
+mod color;
+mod content;
+mod issues;
+mod layout;
 mod pixel;
-pub use pixel::{cluster_diff_regions, PixelDiffThresholds, PixelSimilarity};
+mod scoring;
+mod typography;
 
+// Re-exports
+pub use color::ColorPaletteMetric;
+pub use content::ContentSimilarity;
+pub use issues::generate_top_issues;
+pub use layout::LayoutSimilarity;
+pub use pixel::{cluster_diff_regions, PixelDiffThresholds, PixelSimilarity};
+pub use scoring::{calculate_combined_score, ScoreWeights};
+pub use typography::TypographySimilarity;
+
+/// The kind of metric being computed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricKind {
@@ -68,6 +89,7 @@ impl FromStr for MetricKind {
     }
 }
 
+/// Trait for implementing a design parity metric.
 pub trait Metric {
     fn kind(&self) -> MetricKind;
     fn compute(
@@ -77,6 +99,7 @@ pub trait Metric {
     ) -> Result<MetricResult>;
 }
 
+/// Result of a metric computation, containing the specific metric data.
 #[derive(Debug, Clone)]
 pub enum MetricResult {
     Pixel(PixelMetric),
@@ -108,6 +131,8 @@ impl MetricResult {
     }
 }
 
+// Implement Metric trait for each metric type
+
 impl Metric for PixelSimilarity {
     fn kind(&self) -> MetricKind {
         MetricKind::Pixel
@@ -123,71 +148,6 @@ impl Metric for PixelSimilarity {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct LayoutSimilarity {
-    pub iou_threshold: f32,
-    pub match_threshold: f32,
-}
-
-impl Default for LayoutSimilarity {
-    fn default() -> Self {
-        Self {
-            iou_threshold: 0.5,
-            match_threshold: 0.1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LayoutElement {
-    kind: ElementKind,
-    bbox: crate::types::BoundingBox,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ElementKind {
-    Button,
-    Heading,
-    Text,
-    Image,
-    Input,
-    Other,
-}
-
-impl LayoutSimilarity {
-    fn extract_elements(view: &NormalizedView) -> Vec<LayoutElement> {
-        if let Some(dom) = &view.dom {
-            let elements = dom
-                .nodes
-                .iter()
-                .map(|node| LayoutElement {
-                    kind: element_kind_from_dom(node),
-                    bbox: node.bounding_box,
-                })
-                .collect::<Vec<_>>();
-            if !elements.is_empty() {
-                return elements;
-            }
-        }
-
-        if let Some(figma) = &view.figma_tree {
-            let elements = figma
-                .nodes
-                .iter()
-                .map(|node| LayoutElement {
-                    kind: element_kind_from_figma(node),
-                    bbox: node.bounding_box,
-                })
-                .collect::<Vec<_>>();
-            if !elements.is_empty() {
-                return elements;
-            }
-        }
-
-        Vec::new()
-    }
-}
-
 impl Metric for LayoutSimilarity {
     fn kind(&self) -> MetricKind {
         MetricKind::Layout
@@ -198,196 +158,8 @@ impl Metric for LayoutSimilarity {
         reference: &NormalizedView,
         implementation: &NormalizedView,
     ) -> Result<MetricResult> {
-        let ref_elements = LayoutSimilarity::extract_elements(reference);
-        if ref_elements.is_empty() {
-            return Err(DpcError::Config(
-                "No layout elements available in reference view".to_string(),
-            ));
-        }
-        let mut impl_elements = LayoutSimilarity::extract_elements(implementation);
-
-        if impl_elements.is_empty() {
-            let diff_regions = ref_elements
-                .iter()
-                .map(|ref_el| LayoutDiffRegion {
-                    x: ref_el.bbox.x,
-                    y: ref_el.bbox.y,
-                    width: ref_el.bbox.width,
-                    height: ref_el.bbox.height,
-                    kind: LayoutDiffKind::MissingElement,
-                    element_type: Some(ref_el.kind.as_str().to_string()),
-                    label: None,
-                })
-                .collect::<Vec<_>>();
-
-            return Ok(MetricResult::Layout(LayoutMetric {
-                score: 0.0,
-                diff_regions,
-            }));
-        }
-
-        let ref_count = ref_elements.len();
-        let impl_count = impl_elements.len();
-
-        let mut matches = Vec::new();
-
-        for ref_el in &ref_elements {
-            if let Some((idx, iou)) = best_match(
-                ref_el,
-                &impl_elements,
-                self.match_threshold,
-                self.iou_threshold,
-            ) {
-                matches.push((ref_el, impl_elements[idx], iou));
-                impl_elements.remove(idx);
-            }
-        }
-
-        let matched = matches.len() as f32;
-        let max_count = ref_count.max(impl_count) as f32;
-        let match_rate = if max_count == 0.0 {
-            1.0
-        } else {
-            matched / max_count
-        };
-
-        let avg_iou = if matches.is_empty() {
-            0.0
-        } else {
-            matches.iter().map(|(_, _, iou)| *iou).sum::<f32>() / matches.len() as f32
-        };
-
-        let score = 0.5 * match_rate + 0.5 * avg_iou;
-
-        let mut diff_regions = Vec::new();
-
-        for ref_el in &ref_elements {
-            if !matches.iter().any(|(r, _, _)| std::ptr::eq(*r, ref_el)) {
-                diff_regions.push(LayoutDiffRegion {
-                    x: ref_el.bbox.x,
-                    y: ref_el.bbox.y,
-                    width: ref_el.bbox.width,
-                    height: ref_el.bbox.height,
-                    kind: LayoutDiffKind::MissingElement,
-                    element_type: Some(ref_el.kind.as_str().to_string()),
-                    label: None,
-                });
-            }
-        }
-
-        for extra in &impl_elements {
-            diff_regions.push(LayoutDiffRegion {
-                x: extra.bbox.x,
-                y: extra.bbox.y,
-                width: extra.bbox.width,
-                height: extra.bbox.height,
-                kind: LayoutDiffKind::ExtraElement,
-                element_type: Some(extra.kind.as_str().to_string()),
-                label: None,
-            });
-        }
-
-        for (_, impl_el, iou) in &matches {
-            if *iou < self.iou_threshold {
-                diff_regions.push(LayoutDiffRegion {
-                    x: impl_el.bbox.x,
-                    y: impl_el.bbox.y,
-                    width: impl_el.bbox.width,
-                    height: impl_el.bbox.height,
-                    kind: LayoutDiffKind::PositionShift,
-                    element_type: Some(impl_el.kind.as_str().to_string()),
-                    label: None,
-                });
-            }
-        }
-
-        for impl_el in &impl_elements {
-            diff_regions.push(LayoutDiffRegion {
-                x: impl_el.bbox.x,
-                y: impl_el.bbox.y,
-                width: impl_el.bbox.width,
-                height: impl_el.bbox.height,
-                kind: LayoutDiffKind::ExtraElement,
-                element_type: Some(impl_el.kind.as_str().to_string()),
-                label: None,
-            });
-        }
-
-        Ok(MetricResult::Layout(LayoutMetric {
-            score,
-            diff_regions,
-        }))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct TypographySimilarity {
-    pub size_tolerance: f32,
-    pub line_height_tolerance: f32,
-}
-
-impl Default for TypographySimilarity {
-    fn default() -> Self {
-        Self {
-            size_tolerance: 0.1,
-            line_height_tolerance: 0.1,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TypographyElement {
-    id: String,
-    text: String,
-    family: Option<String>,
-    size: Option<f32>,
-    weight: Option<String>,
-    line_height: Option<f32>,
-}
-
-impl TypographySimilarity {
-    fn extract(view: &NormalizedView) -> Option<Vec<TypographyElement>> {
-        if let Some(dom) = &view.dom {
-            let mut elems = Vec::new();
-            for node in &dom.nodes {
-                if let Some(text) = &node.text {
-                    if let Some(style) = &node.computed_style {
-                        elems.push(TypographyElement {
-                            id: node.id.clone(),
-                            text: text.clone(),
-                            family: style.font_family.clone(),
-                            size: style.font_size,
-                            weight: style.font_weight.clone(),
-                            line_height: style.line_height,
-                        });
-                    }
-                }
-            }
-            if !elems.is_empty() {
-                return Some(elems);
-            }
-        }
-
-        if let Some(figma) = &view.figma_tree {
-            let mut elems = Vec::new();
-            for node in &figma.nodes {
-                if let (Some(text), Some(style)) = (&node.text, &node.typography) {
-                    elems.push(TypographyElement {
-                        id: node.id.clone(),
-                        text: text.clone(),
-                        family: style.font_family.clone(),
-                        size: style.font_size,
-                        weight: style.font_weight.clone(),
-                        line_height: style.line_height,
-                    });
-                }
-            }
-            if !elems.is_empty() {
-                return Some(elems);
-            }
-        }
-
-        None
+        let metric = LayoutSimilarity::compute_metric(self, reference, implementation)?;
+        Ok(MetricResult::Layout(metric))
     }
 }
 
@@ -401,107 +173,8 @@ impl Metric for TypographySimilarity {
         reference: &NormalizedView,
         implementation: &NormalizedView,
     ) -> Result<MetricResult> {
-        let ref_elems = TypographySimilarity::extract(reference).ok_or_else(|| {
-            DpcError::Config("No typography elements available in reference view".to_string())
-        })?;
-        let impl_elems = TypographySimilarity::extract(implementation).ok_or_else(|| {
-            DpcError::Config("No typography elements available in implementation view".to_string())
-        })?;
-
-        let mut impl_by_text: HashMap<String, Vec<TypographyElement>> = HashMap::new();
-        for el in impl_elems {
-            if let Some(norm) = normalize_label(&el.text) {
-                impl_by_text.entry(norm).or_default().push(el);
-            }
-        }
-
-        let mut total_penalty = 0.0f32;
-        let mut comparisons = 0usize;
-        let mut diffs: Vec<TypographyDiff> = Vec::new();
-
-        for ref_el in &ref_elems {
-            comparisons += 1;
-            let Some(norm_text) = normalize_label(&ref_el.text) else {
-                continue;
-            };
-
-            let maybe_impl_list = impl_by_text.get_mut(&norm_text);
-            if let Some(list) = maybe_impl_list {
-                if let Some(impl_el) = list.pop() {
-                    let (penalty, issues) = typography_penalty(
-                        ref_el,
-                        &impl_el,
-                        self.size_tolerance,
-                        self.line_height_tolerance,
-                    );
-                    total_penalty += penalty;
-                    if !issues.is_empty() {
-                        diffs.push(TypographyDiff {
-                            element_id_ref: Some(ref_el.id.clone()),
-                            element_id_impl: Some(impl_el.id.clone()),
-                            issues,
-                            details: None,
-                        });
-                    }
-                } else {
-                    total_penalty += 1.0;
-                    diffs.push(TypographyDiff {
-                        element_id_ref: Some(ref_el.id.clone()),
-                        element_id_impl: None,
-                        issues: vec![TypographyIssue::FontFamilyMismatch],
-                        details: None,
-                    });
-                }
-                if list.is_empty() {
-                    impl_by_text.remove(&norm_text);
-                }
-            } else {
-                total_penalty += 1.0;
-                diffs.push(TypographyDiff {
-                    element_id_ref: Some(ref_el.id.clone()),
-                    element_id_impl: None,
-                    issues: vec![TypographyIssue::FontFamilyMismatch],
-                    details: None,
-                });
-            }
-        }
-
-        // penalize extra implementation texts that did not match any reference
-        for list in impl_by_text.values() {
-            for impl_el in list {
-                comparisons += 1;
-                total_penalty += 0.2;
-                diffs.push(TypographyDiff {
-                    element_id_ref: None,
-                    element_id_impl: Some(impl_el.id.clone()),
-                    issues: vec![TypographyIssue::FontFamilyMismatch],
-                    details: None,
-                });
-            }
-        }
-
-        let score = if comparisons == 0 {
-            1.0
-        } else {
-            (1.0 - (total_penalty / comparisons as f32)).clamp(0.0, 1.0)
-        };
-
-        Ok(MetricResult::Typography(TypographyMetric { score, diffs }))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ColorPaletteMetric {
-    pub clusters: usize,
-    pub sample_stride: u32,
-}
-
-impl Default for ColorPaletteMetric {
-    fn default() -> Self {
-        Self {
-            clusters: 5,
-            sample_stride: 4,
-        }
+        let metric = TypographySimilarity::compute_metric(self, reference, implementation)?;
+        Ok(MetricResult::Typography(metric))
     }
 }
 
@@ -515,54 +188,8 @@ impl Metric for ColorPaletteMetric {
         reference: &NormalizedView,
         implementation: &NormalizedView,
     ) -> Result<MetricResult> {
-        let ref_img = image::open(&reference.screenshot_path).map_err(DpcError::from)?;
-        let impl_img = image::open(&implementation.screenshot_path).map_err(DpcError::from)?;
-
-        let ref_palette = dominant_palette(&ref_img, self.clusters, self.sample_stride);
-        let impl_palette = dominant_palette(&impl_img, self.clusters, self.sample_stride);
-
-        let mut diffs = palette_diffs(&ref_palette, &impl_palette, 3);
-        let mut score = palette_similarity(&ref_palette, &impl_palette);
-        let needs_fallback = diffs.is_empty()
-            || diffs
-                .iter()
-                .all(|d| d.ref_color == d.impl_color && d.delta_e.unwrap_or(0.0) <= 1.0);
-
-        if needs_fallback {
-            let avg_ref = average_rgb(&ref_img);
-            let avg_impl = average_rgb(&impl_img);
-            let delta = rgb_distance(&avg_ref, &avg_impl);
-            diffs.push(ColorDiff {
-                kind: ColorDiffKind::PrimaryColorShift,
-                ref_color: format!("#{:02X}{:02X}{:02X}", avg_ref[0], avg_ref[1], avg_ref[2]),
-                impl_color: format!("#{:02X}{:02X}{:02X}", avg_impl[0], avg_impl[1], avg_impl[2]),
-                delta_e: Some(delta),
-            });
-        }
-
-        let has_meaningful_diff = diffs
-            .iter()
-            .any(|d| d.ref_color != d.impl_color || d.delta_e.unwrap_or(0.0) > 1.0);
-        if has_meaningful_diff {
-            score = score.min(0.8);
-        }
-
-        Ok(MetricResult::Color(ColorMetric { score, diffs }))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ContentSimilarity {
-    pub match_threshold: f32,
-    pub extra_penalty_weight: f32,
-}
-
-impl Default for ContentSimilarity {
-    fn default() -> Self {
-        Self {
-            match_threshold: 0.7,
-            extra_penalty_weight: 0.2,
-        }
+        let metric = ColorPaletteMetric::compute_metric(self, reference, implementation)?;
+        Ok(MetricResult::Color(metric))
     }
 }
 
@@ -576,98 +203,12 @@ impl Metric for ContentSimilarity {
         reference: &NormalizedView,
         implementation: &NormalizedView,
     ) -> Result<MetricResult> {
-        let ref_texts = extract_texts(reference);
-        let impl_texts = extract_texts(implementation);
-
-        if ref_texts.is_empty() && impl_texts.is_empty() {
-            return Ok(MetricResult::Content(ContentMetric {
-                score: 1.0,
-                missing_text: vec![],
-                extra_text: vec![],
-            }));
-        }
-
-        let normalized_ref: Vec<(String, String)> = ref_texts
-            .into_iter()
-            .filter_map(|original| normalize_text(&original).map(|norm| (original, norm)))
-            .collect();
-        let normalized_impl: Vec<(String, String)> = impl_texts
-            .into_iter()
-            .filter_map(|original| normalize_text(&original).map(|norm| (original, norm)))
-            .collect();
-
-        if normalized_ref.is_empty() && normalized_impl.is_empty() {
-            return Ok(MetricResult::Content(ContentMetric {
-                score: 1.0,
-                missing_text: vec![],
-                extra_text: vec![],
-            }));
-        }
-
-        let mut matched_impl = vec![false; normalized_impl.len()];
-        let mut matched_count = 0usize;
-        let mut missing_text = Vec::new();
-
-        for (ref_orig, ref_norm) in &normalized_ref {
-            let mut best_score = 0.0f32;
-            let mut best_idx = None;
-
-            for (idx, (_impl_orig, impl_norm)) in normalized_impl.iter().enumerate() {
-                let score = token_similarity(ref_norm, impl_norm);
-                if score > best_score {
-                    best_score = score;
-                    best_idx = Some(idx);
-                }
-            }
-
-            if best_score >= self.match_threshold {
-                matched_count += 1;
-                if let Some(idx) = best_idx {
-                    matched_impl[idx] = true;
-                }
-            } else {
-                missing_text.push(ref_orig.clone());
-            }
-        }
-
-        let extra_text: Vec<String> = normalized_impl
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, (orig, _))| {
-                if matched_impl[idx] {
-                    None
-                } else {
-                    Some(orig.clone())
-                }
-            })
-            .collect();
-
-        let ref_len = normalized_ref.len() as f32;
-        let base_score = if ref_len == 0.0 {
-            1.0
-        } else {
-            matched_count as f32 / ref_len
-        };
-
-        let ref_chars: usize = normalized_ref.iter().map(|(orig, _)| orig.len()).sum();
-        let extra_chars: usize = extra_text.iter().map(|s| s.len()).sum();
-        let penalty = if ref_chars == 0 {
-            0.0
-        } else {
-            let frac = extra_chars as f32 / ref_chars as f32;
-            (frac * self.extra_penalty_weight).min(0.5)
-        };
-
-        let score = (base_score - penalty).clamp(0.0, 1.0);
-
-        Ok(MetricResult::Content(ContentMetric {
-            score,
-            missing_text,
-            extra_text,
-        }))
+        let metric = ContentSimilarity::compute_metric(self, reference, implementation)?;
+        Ok(MetricResult::Content(metric))
     }
 }
 
+/// Returns the default set of all metrics.
 pub fn default_metrics() -> Vec<Box<dyn Metric>> {
     vec![
         Box::new(PixelSimilarity::default()),
@@ -741,6 +282,7 @@ fn has_content_data(view: &NormalizedView) -> bool {
     false
 }
 
+/// Run the specified metrics on the reference and implementation views.
 pub fn run_metrics(
     metrics: &[Box<dyn Metric>],
     selected: &[MetricKind],
@@ -813,822 +355,13 @@ pub fn run_metrics(
     Ok(scores)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ScoreWeights {
-    pub pixel: f32,
-    pub layout: f32,
-    pub typography: f32,
-    pub color: f32,
-    pub content: f32,
-}
-
-impl Default for ScoreWeights {
-    fn default() -> Self {
-        Self {
-            pixel: 0.35,
-            layout: 0.25,
-            typography: 0.15,
-            color: 0.15,
-            content: 0.10,
-        }
-    }
-}
-
-impl ScoreWeights {
-    pub fn sum(&self) -> f32 {
-        self.pixel + self.layout + self.typography + self.color + self.content
-    }
-}
-
-pub fn calculate_combined_score(scores: &MetricScores, weights: &ScoreWeights) -> f32 {
-    let mut total_weight = 0.0f32;
-    let mut weighted_sum = 0.0f32;
-
-    if let Some(ref m) = scores.pixel {
-        weighted_sum += weights.pixel * m.score;
-        total_weight += weights.pixel;
-    }
-
-    if let Some(ref m) = scores.layout {
-        weighted_sum += weights.layout * m.score;
-        total_weight += weights.layout;
-    }
-
-    if let Some(ref m) = scores.typography {
-        weighted_sum += weights.typography * m.score;
-        total_weight += weights.typography;
-    }
-
-    if let Some(ref m) = scores.color {
-        weighted_sum += weights.color * m.score;
-        total_weight += weights.color;
-    }
-
-    if let Some(ref m) = scores.content {
-        weighted_sum += weights.content * m.score;
-        total_weight += weights.content;
-    }
-
-    if total_weight > 0.0 {
-        weighted_sum / total_weight
-    } else {
-        0.0
-    }
-}
-
-const PRIORITY_PIXEL: u8 = 0;
-const PRIORITY_LAYOUT: u8 = 1;
-const PRIORITY_CONTENT: u8 = 2;
-const PRIORITY_COLOR: u8 = 3;
-const PRIORITY_TYPOGRAPHY: u8 = 4;
-
-#[derive(Debug, Clone)]
-struct RankedIssue {
-    severity_rank: u8,
-    priority_rank: u8,
-    message: String,
-}
-
-impl RankedIssue {
-    fn new(severity_rank: u8, priority_rank: u8, message: impl Into<String>) -> Self {
-        Self {
-            severity_rank,
-            priority_rank,
-            message: message.into(),
-        }
-    }
-
-    fn major(priority_rank: u8, message: impl Into<String>) -> Self {
-        Self::new(0, priority_rank, message)
-    }
-
-    fn moderate(priority_rank: u8, message: impl Into<String>) -> Self {
-        Self::new(1, priority_rank, message)
-    }
-
-    fn minor(priority_rank: u8, message: impl Into<String>) -> Self {
-        Self::new(2, priority_rank, message)
-    }
-}
-
-pub fn generate_top_issues(scores: &MetricScores, max_issues: usize) -> Vec<String> {
-    let mut issues: Vec<RankedIssue> = Vec::new();
-
-    if let Some(ref pixel) = scores.pixel {
-        issues.extend(issues_from_pixel(pixel));
-    }
-
-    if let Some(ref layout) = scores.layout {
-        issues.extend(issues_from_layout(layout));
-    }
-
-    if let Some(ref typography) = scores.typography {
-        issues.extend(issues_from_typography(typography));
-    }
-
-    if let Some(ref color) = scores.color {
-        issues.extend(issues_from_color(color));
-    }
-
-    if let Some(ref content) = scores.content {
-        issues.extend(issues_from_content(content));
-    }
-
-    issues.sort_by(|a, b| {
-        a.severity_rank
-            .cmp(&b.severity_rank)
-            .then_with(|| a.priority_rank.cmp(&b.priority_rank))
-            .then_with(|| a.message.cmp(&b.message))
-    });
-    issues
-        .into_iter()
-        .take(max_issues)
-        .map(|i| i.message)
-        .collect()
-}
-
-fn issues_from_pixel(metric: &PixelMetric) -> Vec<RankedIssue> {
-    let mut issues = Vec::new();
-
-    let major_count = metric
-        .diff_regions
-        .iter()
-        .filter(|r| r.severity == DiffSeverity::Major)
-        .count();
-    let moderate_count = metric
-        .diff_regions
-        .iter()
-        .filter(|r| r.severity == DiffSeverity::Moderate)
-        .count();
-    let minor_count = metric
-        .diff_regions
-        .iter()
-        .filter(|r| r.severity == DiffSeverity::Minor)
-        .count();
-
-    if major_count > 0 {
-        issues.push(RankedIssue::major(
-            PRIORITY_PIXEL,
-            format!(
-            "{} major pixel difference region{} detected.",
-            major_count,
-            if major_count == 1 { "" } else { "s" }
-            ),
-        ));
-    }
-    if moderate_count > 0 {
-        issues.push(RankedIssue::moderate(
-            PRIORITY_PIXEL,
-            format!(
-            "{} moderate pixel difference region{} detected.",
-            moderate_count,
-            if moderate_count == 1 { "" } else { "s" }
-            ),
-        ));
-    }
-    if minor_count > 0 {
-        issues.push(RankedIssue::minor(
-            PRIORITY_PIXEL,
-            format!(
-            "{} minor pixel difference region{} detected.",
-            minor_count,
-            if minor_count == 1 { "" } else { "s" }
-            ),
-        ));
-    }
-
-    issues
-}
-
-fn issues_from_layout(metric: &LayoutMetric) -> Vec<RankedIssue> {
-    let mut issues = Vec::new();
-
-    for region in &metric.diff_regions {
-        let element_desc = region
-            .label
-            .as_ref()
-            .map(|l| format!("'{}'", l))
-            .or_else(|| region.element_type.clone())
-            .unwrap_or_else(|| "element".to_string());
-
-        let msg = match region.kind {
-            LayoutDiffKind::MissingElement => {
-                format!("{} is missing in the implementation.", element_desc)
-            }
-            LayoutDiffKind::ExtraElement => {
-                format!(
-                    "{} appears in implementation but not in reference.",
-                    element_desc
-                )
-            }
-            LayoutDiffKind::PositionShift => {
-                format!("{} is shifted from its expected position.", element_desc)
-            }
-            LayoutDiffKind::SizeChange => {
-                format!("{} has a different size than the reference.", element_desc)
-            }
-        };
-
-        let ranked = match region.kind {
-            LayoutDiffKind::MissingElement => RankedIssue::major(PRIORITY_LAYOUT, msg),
-            LayoutDiffKind::ExtraElement => RankedIssue::moderate(PRIORITY_LAYOUT, msg),
-            LayoutDiffKind::PositionShift | LayoutDiffKind::SizeChange => {
-                RankedIssue::moderate(PRIORITY_LAYOUT, msg)
-            }
-        };
-        issues.push(ranked);
-    }
-
-    issues
-}
-
-fn issues_from_typography(metric: &TypographyMetric) -> Vec<RankedIssue> {
-    let mut issues = Vec::new();
-
-    for diff in &metric.diffs {
-        if diff.issues.is_empty() {
-            continue;
-        }
-
-        let element_id = diff
-            .element_id_ref
-            .as_ref()
-            .or(diff.element_id_impl.as_ref())
-            .cloned()
-            .unwrap_or_else(|| "text element".to_string());
-
-        let issue_names: Vec<&str> = diff
-            .issues
-            .iter()
-            .map(|i| match i {
-                TypographyIssue::FontFamilyMismatch => "font family",
-                TypographyIssue::FontSizeDiff => "font size",
-                TypographyIssue::FontWeightDiff => "font weight",
-                TypographyIssue::LineHeightDiff => "line height",
-            })
-            .collect();
-
-        let msg = if issue_names.len() == 1 {
-            format!(
-                "{} has a different {} than the design.",
-                element_id, issue_names[0]
-            )
-        } else {
-            format!(
-                "{} has different {} than the design.",
-                element_id,
-                issue_names.join(", ")
-            )
-        };
-
-        let ranked = if diff.issues.contains(&TypographyIssue::FontFamilyMismatch) {
-            RankedIssue::major(PRIORITY_TYPOGRAPHY, msg)
-        } else if diff.issues.contains(&TypographyIssue::FontSizeDiff)
-            || diff.issues.contains(&TypographyIssue::FontWeightDiff)
-        {
-            RankedIssue::moderate(PRIORITY_TYPOGRAPHY, msg)
-        } else {
-            RankedIssue::minor(PRIORITY_TYPOGRAPHY, msg)
-        };
-
-        issues.push(ranked);
-    }
-
-    issues
-}
-
-fn issues_from_color(metric: &ColorMetric) -> Vec<RankedIssue> {
-    let mut issues = Vec::new();
-
-    for diff in &metric.diffs {
-        let kind_desc = match diff.kind {
-            ColorDiffKind::PrimaryColorShift => "Primary color shift",
-            ColorDiffKind::AccentColorShift => "Accent color shift",
-            ColorDiffKind::BackgroundColorShift => "Background color shift",
-        };
-
-        let msg = format!(
-            "{} differs: expected {}, got {}.",
-            kind_desc, diff.ref_color, diff.impl_color
-        );
-
-        let ranked = match diff.kind {
-            ColorDiffKind::PrimaryColorShift => RankedIssue::major(PRIORITY_COLOR, msg),
-            ColorDiffKind::AccentColorShift => RankedIssue::major(PRIORITY_COLOR, msg),
-            ColorDiffKind::BackgroundColorShift => RankedIssue::minor(PRIORITY_COLOR, msg),
-        };
-        issues.push(ranked);
-    }
-
-    issues
-}
-
-fn issues_from_content(metric: &ContentMetric) -> Vec<RankedIssue> {
-    let mut issues = Vec::new();
-
-    if !metric.missing_text.is_empty() {
-        let count = metric.missing_text.len();
-        if count <= 3 {
-            for text in &metric.missing_text {
-                let truncated = if text.len() > 50 {
-                    format!("{}...", &text[..47])
-                } else {
-                    text.clone()
-                };
-                issues.push(RankedIssue::major(
-                    PRIORITY_CONTENT,
-                    format!("Text '{}' is missing in the implementation.", truncated),
-                ));
-            }
-        } else {
-            issues.push(RankedIssue::major(
-                PRIORITY_CONTENT,
-                format!(
-                    "{} text elements are missing in the implementation.",
-                    count
-                ),
-            ));
-        }
-    }
-
-    if !metric.extra_text.is_empty() {
-        let count = metric.extra_text.len();
-        if count <= 3 {
-            for text in &metric.extra_text {
-                let truncated = if text.len() > 50 {
-                    format!("{}...", &text[..47])
-                } else {
-                    text.clone()
-                };
-                issues.push(RankedIssue::minor(
-                    PRIORITY_CONTENT,
-                    format!(
-                        "Extra text '{}' appears in implementation but not in design.",
-                        truncated
-                    ),
-                ));
-            }
-        } else {
-            issues.push(RankedIssue::minor(
-                PRIORITY_CONTENT,
-                format!(
-                    "{} extra text elements appear in implementation but not in design.",
-                    count
-                ),
-            ));
-        }
-    }
-
-    issues
-}
-
-
-fn element_kind_from_dom(node: &crate::types::DomNode) -> ElementKind {
-    let tag = node.tag.to_ascii_lowercase();
-    match tag.as_str() {
-        "button" => ElementKind::Button,
-        "img" => ElementKind::Image,
-        "input" | "textarea" | "select" => ElementKind::Input,
-        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => ElementKind::Heading,
-        "p" | "span" | "div" => ElementKind::Text,
-        _ => ElementKind::Other,
-    }
-}
-
-fn element_kind_from_figma(node: &crate::types::FigmaNode) -> ElementKind {
-    let kind = node.node_type.to_ascii_lowercase();
-    match kind.as_str() {
-        "text" => ElementKind::Text,
-        "rectangle" | "ellipse" | "frame" | "component" => ElementKind::Other,
-        "image" => ElementKind::Image,
-        _ => ElementKind::Other,
-    }
-}
-
-impl ElementKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            ElementKind::Button => "button",
-            ElementKind::Heading => "heading",
-            ElementKind::Text => "text",
-            ElementKind::Image => "image",
-            ElementKind::Input => "input",
-            ElementKind::Other => "other",
-        }
-    }
-}
-
-fn iou(a: &crate::types::BoundingBox, b: &crate::types::BoundingBox) -> f32 {
-    let ax2 = a.x + a.width;
-    let ay2 = a.y + a.height;
-    let bx2 = b.x + b.width;
-    let by2 = b.y + b.height;
-
-    let ix1 = a.x.max(b.x);
-    let iy1 = a.y.max(b.y);
-    let ix2 = ax2.min(bx2);
-    let iy2 = ay2.min(by2);
-
-    if ix2 <= ix1 || iy2 <= iy1 {
-        return 0.0;
-    }
-
-    let inter = (ix2 - ix1) * (iy2 - iy1);
-    let area_a = a.width * a.height;
-    let area_b = b.width * b.height;
-    let union = area_a + area_b - inter;
-
-    if union <= 0.0 {
-        0.0
-    } else {
-        inter / union
-    }
-}
-
-fn best_match(
-    target: &LayoutElement,
-    candidates: &[LayoutElement],
-    match_threshold: f32,
-    iou_threshold: f32,
-) -> Option<(usize, f32)> {
-    let mut best: Option<(usize, f32)> = None;
-    for (idx, cand) in candidates.iter().enumerate() {
-        if cand.kind != target.kind {
-            continue;
-        }
-        let overlap = iou(&target.bbox, &cand.bbox);
-        if overlap < match_threshold {
-            continue;
-        }
-        if best.is_none_or(|(_, score)| overlap > score) {
-            best = Some((idx, overlap));
-        }
-    }
-
-    best.filter(|(_, score)| *score >= iou_threshold)
-}
-
-fn typography_penalty(
-    reference: &TypographyElement,
-    implementation: &TypographyElement,
-    size_tolerance: f32,
-    line_height_tolerance: f32,
-) -> (f32, Vec<TypographyIssue>) {
-    const FAMILY_WEIGHT: f32 = 0.6;
-    const SIZE_WEIGHT: f32 = 0.2;
-    const WEIGHT_WEIGHT: f32 = 0.15;
-    const LINE_WEIGHT: f32 = 0.05;
-
-    let mut penalty = 0.0f32;
-    let mut issues = Vec::new();
-
-    let ref_family = canonical_family(reference.family.as_deref());
-    let impl_family = canonical_family(implementation.family.as_deref());
-    if ref_family != impl_family {
-        penalty += FAMILY_WEIGHT;
-        issues.push(TypographyIssue::FontFamilyMismatch);
-    }
-
-    if let (Some(ref_size), Some(impl_size)) = (reference.size, implementation.size) {
-        if ref_size > 0.0 {
-            let diff = ((impl_size - ref_size) / ref_size).abs();
-            if diff > size_tolerance {
-                penalty += SIZE_WEIGHT * diff.min(1.0);
-                issues.push(TypographyIssue::FontSizeDiff);
-            }
-        }
-    }
-
-    let ref_weight = font_weight_category(reference.weight.as_deref());
-    let impl_weight = font_weight_category(implementation.weight.as_deref());
-    if ref_weight.is_some() && impl_weight.is_some() && ref_weight != impl_weight {
-        penalty += WEIGHT_WEIGHT;
-        issues.push(TypographyIssue::FontWeightDiff);
-    }
-
-    if let (Some(ref_lh), Some(impl_lh)) = (reference.line_height, implementation.line_height) {
-        if ref_lh > 0.0 {
-            let diff = ((impl_lh - ref_lh) / ref_lh).abs();
-            if diff > line_height_tolerance {
-                penalty += LINE_WEIGHT * diff.min(1.0);
-                issues.push(TypographyIssue::LineHeightDiff);
-            }
-        }
-    }
-
-    (penalty, issues)
-}
-
-fn normalize_text(input: &str) -> Option<String> {
-    let lower = input.to_lowercase();
-    let mut cleaned = String::new();
-
-    for ch in lower.chars() {
-        if ch.is_alphanumeric() {
-            cleaned.push(ch);
-        } else if ch.is_whitespace() {
-            cleaned.push(' ');
-        }
-    }
-
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        None
-    } else {
-        Some(collapsed)
-    }
-}
-
-fn normalize_label(input: &str) -> Option<String> {
-    normalize_text(input)
-}
-
-fn canonical_family(family: Option<&str>) -> String {
-    let Some(fam) = family else {
-        return "unknown".to_string();
-    };
-    let lower = fam.to_ascii_lowercase();
-    if lower.contains("inter") {
-        "inter".to_string()
-    } else if lower.contains("roboto") {
-        "roboto".to_string()
-    } else if lower.contains("helvetica") {
-        "helvetica".to_string()
-    } else if lower.contains("arial") {
-        "arial".to_string()
-    } else if lower.contains("times") {
-        "times".to_string()
-    } else if lower.contains("georgia") {
-        "georgia".to_string()
-    } else {
-        lower
-    }
-}
-
-fn font_weight_category(weight: Option<&str>) -> Option<u16> {
-    let w = weight?;
-    let lower = w.trim().to_ascii_lowercase();
-    if let Ok(num) = lower.parse::<u16>() {
-        return Some(num);
-    }
-    match lower.as_str() {
-        "thin" => Some(100),
-        "extralight" | "ultralight" => Some(200),
-        "light" => Some(300),
-        "normal" | "regular" => Some(400),
-        "medium" => Some(500),
-        "semibold" | "demibold" => Some(600),
-        "bold" => Some(700),
-        "extrabold" | "ultrabold" => Some(800),
-        "black" | "heavy" => Some(900),
-        _ => None,
-    }
-}
-
-fn dominant_palette(img: &DynamicImage, clusters: usize, stride: u32) -> Vec<(Lab, f32)> {
-    let samples = sample_pixels(img, stride);
-    if samples.is_empty() {
-        return Vec::new();
-    }
-
-    let k = clusters.max(1).min(samples.len());
-    kmeans(&samples, k, 8)
-}
-
-fn sample_pixels(img: &DynamicImage, stride: u32) -> Vec<(Lab, f32)> {
-    let (w, h) = img.dimensions();
-    let mut samples = Vec::new();
-    let step = stride.max(1);
-
-    for y in (0..h).step_by(step as usize) {
-        for x in (0..w).step_by(step as usize) {
-            let pixel = img.get_pixel(x, y).0;
-            let srgb = Srgb::new(
-                pixel[0] as f32 / 255.0,
-                pixel[1] as f32 / 255.0,
-                pixel[2] as f32 / 255.0,
-            );
-            let lab: Lab = Lab::from_color_unclamped(srgb);
-            samples.push((lab, 1.0));
-        }
-    }
-
-    samples
-}
-
-fn kmeans(samples: &[(Lab, f32)], k: usize, iterations: usize) -> Vec<(Lab, f32)> {
-    let mut centers: Vec<Lab> = Vec::with_capacity(k);
-    let mut weights = Vec::with_capacity(k);
-
-    let step = (samples.len() / k).max(1);
-    for i in 0..k {
-        centers.push(samples[i * step % samples.len()].0);
-    }
-
-    for _ in 0..iterations {
-        let mut accum = vec![(0.0f32, 0.0f32, 0.0f32, 0.0f32); k];
-        weights.clear();
-        weights.resize(k, 0.0f32);
-
-        for (lab, w) in samples {
-            let (idx, _) = centers
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, lab_distance2(*lab, *c)))
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                .unwrap();
-
-            accum[idx].0 += lab.l * w;
-            accum[idx].1 += lab.a * w;
-            accum[idx].2 += lab.b * w;
-            accum[idx].3 += w;
-            weights[idx] += *w;
-        }
-
-        for i in 0..k {
-            if accum[i].3 > 0.0 {
-                centers[i] = Lab::new(
-                    accum[i].0 / accum[i].3,
-                    accum[i].1 / accum[i].3,
-                    accum[i].2 / accum[i].3,
-                );
-            }
-        }
-    }
-
-    let total_weight: f32 = weights.iter().copied().sum::<f32>().max(f32::EPSILON);
-    centers
-        .into_iter()
-        .zip(weights)
-        .map(|(c, w)| (c, w / total_weight))
-        .collect()
-}
-
-fn palette_similarity(ref_palette: &[(Lab, f32)], impl_palette: &[(Lab, f32)]) -> f32 {
-    if ref_palette.is_empty() || impl_palette.is_empty() {
-        return 0.0;
-    }
-
-    ref_palette
-        .iter()
-        .map(|(lab_ref, weight)| {
-            let delta = impl_palette
-                .iter()
-                .map(|(lab_impl, _)| lab_distance2(*lab_ref, *lab_impl).sqrt())
-                .fold(f32::INFINITY, f32::min);
-
-            let match_score = 1.0 - (delta / 25.0).min(1.0);
-            weight * match_score
-        })
-        .sum::<f32>()
-}
-
-fn palette_diffs(
-    ref_palette: &[(Lab, f32)],
-    impl_palette: &[(Lab, f32)],
-    top_n: usize,
-) -> Vec<ColorDiff> {
-    if ref_palette.is_empty() || impl_palette.is_empty() {
-        return Vec::new();
-    }
-
-    let mut sorted = ref_palette.to_vec();
-    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    sorted.truncate(top_n);
-
-    let mut diffs = Vec::new();
-    for (idx, (lab_ref, _w)) in sorted.iter().enumerate() {
-        if let Some((lab_impl, delta)) = impl_palette
-            .iter()
-            .map(|(l, _)| {
-                let d = lab_distance2(*lab_ref, *l).sqrt();
-                (l, d)
-            })
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-        {
-            let kind = match idx {
-                0 => ColorDiffKind::PrimaryColorShift,
-                1 => ColorDiffKind::AccentColorShift,
-                _ => ColorDiffKind::BackgroundColorShift,
-            };
-            diffs.push(ColorDiff {
-                kind,
-                ref_color: lab_to_hex(*lab_ref),
-                impl_color: lab_to_hex(*lab_impl),
-                delta_e: Some(delta),
-            });
-        }
-    }
-
-    diffs
-}
-
-fn average_rgb(img: &DynamicImage) -> [u8; 3] {
-    let mut sum = [0u64; 3];
-    let mut count = 0u64;
-    for (_x, _y, pixel) in img.pixels() {
-        let c = pixel.0;
-        sum[0] += c[0] as u64;
-        sum[1] += c[1] as u64;
-        sum[2] += c[2] as u64;
-        count += 1;
-    }
-    if count == 0 {
-        return [0, 0, 0];
-    }
-    [
-        (sum[0] / count) as u8,
-        (sum[1] / count) as u8,
-        (sum[2] / count) as u8,
-    ]
-}
-
-fn rgb_distance(a: &[u8; 3], b: &[u8; 3]) -> f32 {
-    let dr = a[0] as f32 - b[0] as f32;
-    let dg = a[1] as f32 - b[1] as f32;
-    let db = a[2] as f32 - b[2] as f32;
-    ((dr * dr + dg * dg + db * db).sqrt()).max(0.0)
-}
-
-fn lab_to_hex(lab: Lab) -> String {
-    let srgb: Srgb = Srgb::from_color_unclamped(lab);
-    let clamp = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    format!(
-        "#{:02X}{:02X}{:02X}",
-        clamp(srgb.red),
-        clamp(srgb.green),
-        clamp(srgb.blue)
-    )
-}
-
-fn lab_distance2(a: Lab, b: Lab) -> f32 {
-    let dl = a.l - b.l;
-    let da = a.a - b.a;
-    let db = a.b - b.b;
-    dl * dl + da * da + db * db
-}
-
-fn extract_texts(view: &NormalizedView) -> Vec<String> {
-    let mut texts = Vec::new();
-
-    if let Some(dom) = &view.dom {
-        for node in &dom.nodes {
-            if let Some(text) = &node.text {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    texts.push(trimmed.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(figma) = &view.figma_tree {
-        for node in &figma.nodes {
-            if let Some(text) = &node.text {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    texts.push(trimmed.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(blocks) = &view.ocr_blocks {
-        for block in blocks {
-            let trimmed = block.text.trim();
-            if !trimmed.is_empty() {
-                texts.push(trimmed.to_string());
-            }
-        }
-    }
-
-    texts
-}
-
-fn token_similarity(a: &str, b: &str) -> f32 {
-    let set_a: HashSet<&str> = a.split_whitespace().collect();
-    let set_b: HashSet<&str> = b.split_whitespace().collect();
-
-    if set_a.is_empty() && set_b.is_empty() {
-        return 1.0;
-    }
-
-    let intersection = set_a.intersection(&set_b).count() as f32;
-    let denom = (set_a.len() + set_b.len()) as f32;
-
-    if denom == 0.0 {
-        0.0
-    } else {
-        (2.0 * intersection) / denom
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{
         ColorMetric, ComputedStyle, ContentMetric, LayoutMetric, PixelDiffReason, PixelDiffRegion,
-        PixelMetric, ResourceKind, TypographyMetric, TypographyStyle,
+        PixelMetric, ResourceKind, TypographyMetric, TypographyStyle, DiffSeverity,
+        LayoutDiffRegion, LayoutDiffKind, ColorDiff, ColorDiffKind, TypographyDiff, TypographyIssue,
     };
     use image::{ImageFormat, Rgba, RgbaImage};
     use std::cell::RefCell;
@@ -2099,7 +832,7 @@ mod tests {
             ("button", bbox(0.0, 0.0, 0.5, 0.5)),
             ("img", bbox(0.6, 0.1, 0.3, 0.3)),
         ]);
-        let impl_view = view_with_dom(vec![]); // no matching elements
+        let impl_view = view_with_dom(vec![]);
         let metric = LayoutSimilarity::default();
         let layout = match metric.compute(&ref_view, &impl_view).expect("should score even when implementation layout is empty") {
             MetricResult::Layout(m) => m,
@@ -2138,7 +871,7 @@ mod tests {
 
     #[test]
     fn layout_metric_errors_when_reference_missing_layout() {
-        let ref_view = dummy_view(); // no DOM or figma
+        let ref_view = dummy_view();
         let impl_view = view_with_dom(vec![("div", bbox(0.0, 0.0, 0.5, 0.5))]);
         let metric = LayoutSimilarity::default();
         let err = metric.compute(&ref_view, &impl_view).unwrap_err();
@@ -2366,7 +1099,7 @@ mod tests {
             ("p:Hello", bbox(0.0, 0.0, 0.5, 0.5)),
             ("h1:Title", bbox(0.0, 0.5, 0.5, 0.5)),
         ]);
-        let impl_view = view_with_dom(vec![]); // implementation missing all text
+        let impl_view = view_with_dom(vec![]);
         let metric = ContentSimilarity::default();
         let content = match metric.compute(&ref_view, &impl_view).unwrap() {
             MetricResult::Content(c) => c,
