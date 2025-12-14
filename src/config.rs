@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -18,6 +18,19 @@ pub struct Config {
     pub threshold: f64,
     pub metric_weights: MetricWeights,
     pub timeouts: Timeouts,
+    pub semantic: SemanticConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SemanticConfig {
+    pub api_key: Option<String>,
+    pub api_endpoint: Option<String>,
+    pub model: Option<String>,
+    pub max_regions: Option<usize>,
+    /// Minimum intensity threshold (0.0-1.0) for regions to analyze.
+    /// Regions below this threshold are skipped as likely rendering noise.
+    pub min_intensity: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +84,7 @@ impl Default for Config {
             threshold: 0.95,
             metric_weights: MetricWeights::default(),
             timeouts: Timeouts::default(),
+            semantic: SemanticConfig::default(),
         }
     }
 }
@@ -100,6 +114,23 @@ where
 }
 
 impl Config {
+    /// Returns the path to the central config file (~/.config/dpc/config.toml).
+    /// Returns None if the home directory cannot be determined.
+    pub fn central_config_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|p| p.join("dpc").join("config.toml"))
+    }
+
+    /// Load configuration from the central config location if it exists.
+    /// Returns default config if the central config file is not found.
+    pub fn from_central_config() -> Result<Self, std::io::Error> {
+        if let Some(path) = Self::central_config_path() {
+            if path.exists() {
+                return Self::from_toml_file(&path);
+            }
+        }
+        Ok(Self::default())
+    }
+
     /// Load configuration from a TOML file. Missing fields fall back to defaults.
     pub fn from_toml_file(path: &Path) -> Result<Self, std::io::Error> {
         let contents = fs::read_to_string(path)?;
@@ -107,6 +138,17 @@ impl Config {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         cfg.apply_defaults();
         Ok(cfg)
+    }
+
+    /// Load configuration with fallback chain:
+    /// 1. Explicit path (if provided)
+    /// 2. Central config (~/.config/dpc/config.toml)
+    /// 3. Default config
+    pub fn load(explicit_path: Option<&Path>) -> Result<Self, std::io::Error> {
+        if let Some(path) = explicit_path {
+            return Self::from_toml_file(path);
+        }
+        Self::from_central_config()
     }
 
     /// Ensure defaults are applied when deserializing partial configs.
@@ -191,7 +233,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, MetricWeights, Timeouts};
+    use super::{Config, MetricWeights, SemanticConfig, Timeouts};
     use crate::Viewport;
     use std::time::Duration;
 
@@ -229,6 +271,7 @@ mod tests {
                 network_idle: Duration::from_secs(5),
                 process: Duration::from_secs(60),
             },
+            semantic: SemanticConfig::default(),
         };
 
         assert_eq!(cfg.viewport.width, 1280);

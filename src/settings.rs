@@ -90,15 +90,16 @@ pub fn resolve_compare_settings(
     }
 }
 
-/// Load config from a TOML file or return defaults.
+/// Load config from a TOML file, central config, or return defaults.
+/// Priority: explicit path > ~/.config/dpc/config.toml > defaults
 pub fn load_config(path: Option<&Path>) -> Result<Config, DpcError> {
-    let cfg = if let Some(p) = path {
-        Config::from_toml_file(p).map_err(|e| {
-            DpcError::Config(format!("Failed to read config {}: {}", p.display(), e))
-        })?
-    } else {
-        Config::default()
-    };
+    let cfg = Config::load(path).map_err(|e| {
+        let loc = path
+            .map(|p| p.display().to_string())
+            .or_else(|| Config::central_config_path().map(|p| p.display().to_string()))
+            .unwrap_or_else(|| "defaults".to_string());
+        DpcError::Config(format!("Failed to read config {}: {}", loc, e))
+    })?;
 
     cfg.validate().map_err(|e| {
         let prefix = path
@@ -171,7 +172,7 @@ pub fn format_effective_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dpc_lib::config::{MetricWeights, Timeouts};
+    use dpc_lib::config::{MetricWeights, SemanticConfig, Timeouts};
     use std::time::Duration;
 
     #[test]
@@ -194,6 +195,7 @@ mod tests {
                 network_idle: Duration::from_secs(6),
                 process: Duration::from_secs(7),
             },
+            semantic: SemanticConfig::default(),
         };
         let flags = CompareFlagSources::default();
         let resolved = resolve_compare_settings(
