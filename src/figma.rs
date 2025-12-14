@@ -1,9 +1,10 @@
+use crate::figma_client::FigmaAuth;
 use crate::types::{
     BoundingBox, FigmaNode, FigmaPaint, FigmaPaintKind, FigmaSnapshot, NormalizedView,
     ResourceKind, TypographyStyle,
 };
 use crate::{image_loader::resize_with_letterbox, DpcError, Result, Viewport};
-use image::{load_from_memory, GenericImageView};
+use image::{load_from_memory, DynamicImage, GenericImageView};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -44,7 +45,9 @@ fn map_figma_error(e: FigmaError) -> DpcError {
             ),
             message,
         },
-        FigmaError::MissingToken => DpcError::Config("Missing Figma access token".to_string()),
+        FigmaError::MissingToken => DpcError::Config(
+            "Missing Figma token; set FIGMA_TOKEN or FIGMA_OAUTH_TOKEN".to_string(),
+        ),
         FigmaError::InvalidFileKey(key) => DpcError::FigmaApi {
             status: None,
             message: format!("Invalid Figma file key: {}", key),
@@ -62,16 +65,41 @@ fn map_figma_error(e: FigmaError) -> DpcError {
 
 impl FigmaClient {
     pub fn new(access_token: impl Into<String>) -> std::result::Result<Self, FigmaError> {
-        let token = access_token.into();
+        Self::from_auth(FigmaAuth::PersonalAccessToken(access_token.into()))
+    }
+
+    pub fn from_auth(auth: FigmaAuth) -> std::result::Result<Self, FigmaError> {
+        Self::with_base_url(auth, "https://api.figma.com/v1")
+    }
+
+    pub fn with_base_url(
+        auth: FigmaAuth,
+        base_url: impl Into<String>,
+    ) -> std::result::Result<Self, FigmaError> {
+        let token = match &auth {
+            FigmaAuth::PersonalAccessToken(token) | FigmaAuth::OAuthToken(token) => token.clone(),
+        };
+
         if token.is_empty() {
             return Err(FigmaError::MissingToken);
         }
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", token)).expect("Invalid token format"),
-        );
+        match auth {
+            FigmaAuth::PersonalAccessToken(token) => {
+                headers.insert(
+                    reqwest::header::HeaderName::from_static("x-figma-token"),
+                    HeaderValue::from_str(&token).map_err(|_| FigmaError::MissingToken)?,
+                );
+            }
+            FigmaAuth::OAuthToken(token) => {
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {}", token))
+                        .map_err(|_| FigmaError::MissingToken)?,
+                );
+            }
+        }
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
@@ -82,7 +110,7 @@ impl FigmaClient {
         Ok(Self {
             client,
             access_token: token,
-            base_url: "https://api.figma.com/v1".to_string(),
+            base_url: base_url.into(),
         })
     }
 
@@ -133,6 +161,12 @@ impl FigmaClient {
 
     pub async fn download_image(&self, url: &str) -> std::result::Result<Vec<u8>, FigmaError> {
         let response = self.client.get(url).send().await?;
+        if !response.status().is_success() {
+            return Err(FigmaError::Api {
+                status: response.status().as_u16(),
+                message: response.text().await.unwrap_or_default(),
+            });
+        }
         Ok(response.bytes().await?.to_vec())
     }
 
@@ -244,7 +278,18 @@ pub async fn figma_to_normalized_view(
         .await
         .map_err(map_figma_error)?;
 
-    let (width, height) = finalize_figma_image(&bytes, &options.output_path, options.viewport)?;
+    let decoded_image = load_from_memory(&bytes)?;
+    let source_dimensions = decoded_image.dimensions();
+    let (width, height, letterbox) =
+        finalize_figma_image(decoded_image, &options.output_path, options.viewport)?;
+
+    let root_bb = node
+        .document
+        .absolute_bounding_box
+        .as_ref()
+        .map(|bb| map_bounding_box(Some(bb)));
+    let figma_snapshot =
+        normalize_figma_snapshot(figma_snapshot, root_bb, source_dimensions, &letterbox);
 
     Ok(NormalizedView {
         kind: ResourceKind::Figma,
@@ -443,32 +488,116 @@ fn map_paint(paint: &FigmaPaintData) -> Option<FigmaPaint> {
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LetterboxTransform {
+    scale: f32,
+    offset_x: f32,
+    offset_y: f32,
+}
+
+fn compute_letterbox_transform(
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> LetterboxTransform {
+    let scale_w = target_width as f64 / source_width as f64;
+    let scale_h = target_height as f64 / source_height as f64;
+    let scale = scale_w.min(scale_h);
+    let new_w = (source_width as f64 * scale).round() as u32;
+    let new_h = (source_height as f64 * scale).round() as u32;
+    let offset_x = ((target_width as i64 - new_w as i64) / 2) as f32;
+    let offset_y = ((target_height as i64 - new_h as i64) / 2) as f32;
+
+    LetterboxTransform {
+        scale: scale as f32,
+        offset_x,
+        offset_y,
+    }
+}
+
 fn finalize_figma_image(
-    bytes: &[u8],
+    img: DynamicImage,
     output_path: &std::path::Path,
     viewport: Option<Viewport>,
-) -> Result<(u32, u32)> {
-    let mut img = load_from_memory(bytes)?;
-    let (mut width, mut height) = img.dimensions();
+) -> Result<(u32, u32, LetterboxTransform)> {
+    let (source_width, source_height) = img.dimensions();
+    let (target_width, target_height) = viewport
+        .map(|vp| (vp.width, vp.height))
+        .unwrap_or((source_width, source_height));
 
-    if let Some(vp) = viewport {
-        img = resize_with_letterbox(&img, vp.width, vp.height);
-        width = vp.width;
-        height = vp.height;
-    }
+    let letterbox =
+        compute_letterbox_transform(source_width, source_height, target_width, target_height);
+
+    let final_img = if viewport.is_some() {
+        resize_with_letterbox(&img, target_width, target_height)
+    } else {
+        img
+    };
 
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    img.save(output_path)?;
+    final_img.save(output_path)?;
 
-    Ok((width, height))
+    Ok((target_width, target_height, letterbox))
+}
+
+fn normalize_figma_snapshot(
+    snapshot: FigmaSnapshot,
+    root_bb: Option<BoundingBox>,
+    source_dimensions: (u32, u32),
+    letterbox: &LetterboxTransform,
+) -> FigmaSnapshot {
+    let (source_w, source_h) = source_dimensions;
+    let (root_x, root_y, root_w, root_h) = root_bb
+        .map(|bb| (bb.x, bb.y, bb.width, bb.height))
+        .unwrap_or((0.0, 0.0, source_w as f32, source_h as f32));
+
+    let scale_x = if root_w > 0.0 {
+        source_w as f32 / root_w
+    } else {
+        1.0
+    };
+    let scale_y = if root_h > 0.0 {
+        source_h as f32 / root_h
+    } else {
+        1.0
+    };
+
+    let mut nodes = Vec::with_capacity(snapshot.nodes.len());
+    for node in snapshot.nodes {
+        let rel_x = node.bounding_box.x - root_x;
+        let rel_y = node.bounding_box.y - root_y;
+
+        let scaled_x = rel_x * scale_x;
+        let scaled_y = rel_y * scale_y;
+        let scaled_w = node.bounding_box.width * scale_x;
+        let scaled_h = node.bounding_box.height * scale_y;
+
+        let final_x = scaled_x * letterbox.scale + letterbox.offset_x;
+        let final_y = scaled_y * letterbox.scale + letterbox.offset_y;
+        let final_w = scaled_w * letterbox.scale;
+        let final_h = scaled_h * letterbox.scale;
+
+        nodes.push(FigmaNode {
+            bounding_box: BoundingBox {
+                x: final_x,
+                y: final_y,
+                width: final_w,
+                height: final_h,
+            },
+            ..node
+        });
+    }
+
+    FigmaSnapshot { nodes, ..snapshot }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{codecs::png::PngEncoder, ColorType, ImageEncoder, RgbaImage};
+    use image::{DynamicImage, RgbaImage};
     use tempfile::TempDir;
 
     #[test]
@@ -594,16 +723,10 @@ mod tests {
         let out_path = dir.path().join("out.png");
 
         let img = RgbaImage::from_pixel(10, 5, image::Rgba([255, 0, 0, 255]));
-        let mut buf = Vec::new();
-        {
-            let mut cursor = std::io::Cursor::new(&mut buf);
-            PngEncoder::new(&mut cursor)
-                .write_image(img.as_raw(), 10, 5, ColorType::Rgba8.into())
-                .expect("encode png");
-        }
+        let img = DynamicImage::ImageRgba8(img);
 
-        let (w, h) = finalize_figma_image(
-            &buf,
+        let (w, h, _) = finalize_figma_image(
+            img,
             &out_path,
             Some(Viewport {
                 width: 20,
@@ -623,18 +746,77 @@ mod tests {
         let out_path = dir.path().join("out.png");
 
         let img = RgbaImage::from_pixel(12, 8, image::Rgba([0, 0, 255, 255]));
-        let mut buf = Vec::new();
-        {
-            let mut cursor = std::io::Cursor::new(&mut buf);
-            PngEncoder::new(&mut cursor)
-                .write_image(img.as_raw(), 12, 8, ColorType::Rgba8.into())
-                .expect("encode png");
-        }
+        let img = DynamicImage::ImageRgba8(img);
 
-        let (w, h) = finalize_figma_image(&buf, &out_path, None).expect("finalize");
+        let (w, h, transform) = finalize_figma_image(img, &out_path, None).expect("finalize");
 
         assert_eq!((w, h), (12, 8));
         let saved = image::open(&out_path).expect("open saved");
         assert_eq!(saved.dimensions(), (12, 8));
+        assert_eq!(transform.scale, 1.0);
+        assert_eq!(transform.offset_x, 0.0);
+        assert_eq!(transform.offset_y, 0.0);
+    }
+
+    #[test]
+    fn normalize_figma_snapshot_offsets_and_scales_to_viewport() {
+        let root_bb = BoundingBox {
+            x: 100.0,
+            y: 200.0,
+            width: 100.0,
+            height: 50.0,
+        };
+        let mut snapshot = FigmaSnapshot {
+            file_key: "FILE".into(),
+            node_id: "root".into(),
+            name: Some("Frame".into()),
+            nodes: vec![
+                FigmaNode {
+                    id: "root".into(),
+                    name: Some("Frame".into()),
+                    node_type: "FRAME".into(),
+                    bounding_box: root_bb,
+                    text: None,
+                    typography: None,
+                    fills: vec![],
+                    children: vec!["child".into()],
+                },
+                FigmaNode {
+                    id: "child".into(),
+                    name: Some("Text".into()),
+                    node_type: "TEXT".into(),
+                    bounding_box: BoundingBox {
+                        x: 120.0,
+                        y: 210.0,
+                        width: 20.0,
+                        height: 10.0,
+                    },
+                    text: Some("Hi".into()),
+                    typography: Some(TypographyStyle {
+                        font_family: Some("Inter".into()),
+                        font_size: Some(16.0),
+                        font_weight: Some("600".into()),
+                        line_height: Some(24.0),
+                    }),
+                    fills: vec![],
+                    children: vec![],
+                },
+            ],
+        };
+
+        let letterbox = compute_letterbox_transform(100, 50, 200, 200);
+        snapshot = normalize_figma_snapshot(snapshot, Some(root_bb), (100, 50), &letterbox);
+
+        let root = snapshot.nodes.iter().find(|n| n.id == "root").unwrap();
+        assert_eq!(root.bounding_box.x, 0.0);
+        assert_eq!(root.bounding_box.y, 50.0);
+        assert_eq!(root.bounding_box.width, 200.0);
+        assert_eq!(root.bounding_box.height, 100.0);
+
+        let child = snapshot.nodes.iter().find(|n| n.id == "child").unwrap();
+        assert!((child.bounding_box.x - 40.0).abs() < f32::EPSILON);
+        assert!((child.bounding_box.y - 70.0).abs() < f32::EPSILON);
+        assert!((child.bounding_box.width - 40.0).abs() < f32::EPSILON);
+        assert!((child.bounding_box.height - 20.0).abs() < f32::EPSILON);
     }
 }
