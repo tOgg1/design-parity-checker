@@ -12,7 +12,7 @@ mod tests {
     };
     use crate::types::{BoundingBox, FigmaNode, FigmaSnapshot, TypographyStyle};
     use crate::Viewport;
-    use image::{DynamicImage, RgbaImage};
+    use image::{DynamicImage, GenericImageView, RgbaImage};
     use tempfile::TempDir;
 
     #[test]
