@@ -4,9 +4,11 @@ use crate::types::{
     LayoutDiffKind, LayoutDiffRegion, LayoutMetric, PixelDiffReason, PixelDiffRegion, PixelMetric,
     ResourceKind, TypographyDiff, TypographyIssue, TypographyMetric, TypographyStyle,
 };
+use crate::{MetricScores, NormalizedView};
 use image::{ImageFormat, Rgba, RgbaImage};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::str::FromStr;
 use tempfile::NamedTempFile;
 
 #[test]
