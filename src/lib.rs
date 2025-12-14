@@ -36,6 +36,7 @@
 pub mod browser;
 pub mod config;
 pub mod error;
+#[path = "figma/mod.rs"]
 pub mod figma;
 pub mod figma_client;
 pub mod image_loader;
