@@ -94,9 +94,22 @@ Behavior:
   "findings": [
     {
       "severity": "warning",
-      "type": "hierarchy_missing",
-      "message": "No headings detected (h1-h3); add hierarchy for scannability."
+      "type": "alignment_inconsistent",
+      "message": "2 of 10 elements deviate from 3 column(s) (tolerance ~16px)."
+    },
+    {
+      "severity": "info",
+      "type": "low_contrast",
+      "message": "1 of 5 text samples below 4.0 contrast (worst 2.8). Aim for ≥4.5."
     }
   ]
 }
 ```
+
+Quality finding types:
+- `alignment_inconsistent`
+- `spacing_inconsistent`
+- `low_contrast`
+- `missing_hierarchy`
+
+Severity is `info`, `warning`, or `error`.

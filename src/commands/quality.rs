@@ -5,12 +5,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use dpc_lib::output::DPC_OUTPUT_VERSION;
-use dpc_lib::types::{DomNode, FigmaNode, NormalizedView, ResourceKind};
+use dpc_lib::types::{BoundingBox, DomNode, FigmaNode, FigmaPaintKind, NormalizedView, ResourceKind};
 use dpc_lib::QualityFindingType;
 use dpc_lib::{
     parse_resource, DpcError, DpcOutput, FindingSeverity, QualityFinding, QualityOutput,
     ResourceDescriptor, Viewport,
 };
+use image::{DynamicImage, GenericImageView};
 
 use crate::cli::OutputFormat;
 use crate::formatting::{render_error, write_output};
@@ -181,11 +182,21 @@ fn score_quality(view: &NormalizedView, viewport: &Viewport) -> (f32, Vec<Qualit
         }
     }
 
+    let (hierarchy_delta, hierarchy_finding) = hierarchy_heuristic(view);
+    score += hierarchy_delta;
+    findings.push(hierarchy_finding);
+
     let (alignment_score, alignment_finding) = alignment_heuristic(view, viewport);
     if let Some(alignment_score) = alignment_score {
         score += alignment_score * 0.15;
     }
     findings.push(alignment_finding);
+
+    let (contrast_score, contrast_finding) = contrast_heuristic(view);
+    if let Some(contrast_score) = contrast_score {
+        score += contrast_score * 0.15;
+    }
+    findings.push(contrast_finding);
 
     if let Some((finding, penalty)) = evaluate_spacing(&spacing_gaps) {
         findings.push(finding);
@@ -194,12 +205,6 @@ fn score_quality(view: &NormalizedView, viewport: &Viewport) -> (f32, Vec<Qualit
         // Mild boost when spacing looks coherent (few distinct gaps).
         score += 0.02;
     }
-    findings.push(QualityFinding {
-        severity: FindingSeverity::Info,
-        finding_type: QualityFindingType::LowContrast,
-        message: "Contrast heuristic not implemented yet (see design-parity-checker-vqg)."
-            .to_string(),
-    });
 
     (score.clamp(0.0, 1.0), findings)
 }
@@ -303,6 +308,415 @@ fn alignment_heuristic(
             message,
         },
     )
+}
+
+fn hierarchy_heuristic(view: &NormalizedView) -> (f32, QualityFinding) {
+    const TOLERANCE: f32 = 0.10; // 10% difference counts as a new tier
+    let mut sizes = collect_font_sizes(view);
+
+    if sizes.is_empty() {
+        return (
+            -0.05,
+            QualityFinding {
+                severity: FindingSeverity::Warning,
+                finding_type: QualityFindingType::MissingHierarchy,
+                message:
+                    "No font size data found; add text with explicit sizes to establish hierarchy."
+                        .to_string(),
+            },
+        );
+    }
+
+    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let mut tiers: Vec<f32> = Vec::new();
+    for size in sizes {
+        if let Some(rep) = tiers.last().copied() {
+            let delta = (size - rep).abs();
+            if delta > rep * TOLERANCE {
+                tiers.push(size);
+            }
+        } else {
+            tiers.push(size);
+        }
+    }
+
+    let tier_count = tiers.len();
+    match tier_count {
+        0 | 1 => (
+            -0.08,
+            QualityFinding {
+                severity: FindingSeverity::Warning,
+                finding_type: QualityFindingType::MissingHierarchy,
+                message:
+                    "Only one text size detected; add 2–3 tiers (title/subtitle/body) for hierarchy."
+                        .to_string(),
+            },
+        ),
+        2 | 3 => (
+            0.08,
+            QualityFinding {
+                severity: FindingSeverity::Info,
+                finding_type: QualityFindingType::MissingHierarchy,
+                message: format!(
+                    "Hierarchy looks healthy with {} distinct text size tier(s).",
+                    tier_count
+                ),
+            },
+        ),
+        _ => (
+            -0.04,
+            QualityFinding {
+                severity: FindingSeverity::Warning,
+                finding_type: QualityFindingType::MissingHierarchy,
+                message: format!(
+                    "Found {} distinct text sizes; consolidate to 2–3 tiers for clearer hierarchy.",
+                    tier_count
+                ),
+            },
+        ),
+    }
+}
+
+fn collect_font_sizes(view: &NormalizedView) -> Vec<f32> {
+    let mut sizes = Vec::new();
+
+    if let Some(dom) = &view.dom {
+        for node in dom.nodes.iter().filter(|n| node_has_text(n)) {
+            if let Some(size) = node
+                .computed_style
+                .as_ref()
+                .and_then(|style| style.font_size)
+            {
+                sizes.push(size);
+            }
+        }
+    }
+
+    if let Some(figma) = &view.figma_tree {
+        for node in figma.nodes.iter().filter(|n| figma_has_text(n)) {
+            if let Some(size) = node
+                .typography
+                .as_ref()
+                .and_then(|style| style.font_size)
+            {
+                sizes.push(size);
+            }
+        }
+    }
+
+    sizes
+}
+
+fn contrast_heuristic(view: &NormalizedView) -> (Option<f32>, QualityFinding) {
+    let img = match image::open(&view.screenshot_path) {
+        Ok(img) => img,
+        Err(err) => {
+            return (
+                None,
+                QualityFinding {
+                    severity: FindingSeverity::Info,
+                    finding_type: QualityFindingType::LowContrast,
+                    message: format!(
+                        "Could not read screenshot for contrast heuristic: {}",
+                        err
+                    ),
+                },
+            )
+        }
+    };
+
+    let mut ratios = Vec::new();
+
+    if let Some(dom) = &view.dom {
+        for node in dom.nodes.iter().filter(|n| node_has_text(n)) {
+            if let Some(r) = contrast_for_dom_node(node, &img, view) {
+                ratios.push(r);
+            }
+        }
+    }
+
+    if let Some(figma) = &view.figma_tree {
+        for node in figma.nodes.iter().filter(|n| figma_has_text(n)) {
+            if let Some(r) = contrast_for_figma_node(node, &img, view) {
+                ratios.push(r);
+            }
+        }
+    }
+
+    if ratios.is_empty() {
+        return (
+            None,
+            QualityFinding {
+                severity: FindingSeverity::Info,
+                finding_type: QualityFindingType::LowContrast,
+                message: "Not enough text samples to assess contrast (missing color data)."
+                    .to_string(),
+            },
+        );
+    }
+
+    let threshold = 4.0;
+    let low = ratios.iter().filter(|r| **r < threshold).count();
+    let worst = ratios
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min)
+        .max(0.0);
+
+    let contrast_score = (ratios.len().saturating_sub(low) as f32 / ratios.len() as f32).clamp(0.0, 1.0);
+    let severity = if low >= 3 || worst < 3.0 {
+        FindingSeverity::Warning
+    } else {
+        FindingSeverity::Info
+    };
+    let message = format!(
+        "{} of {} text samples below {:.1} contrast (worst {:.1}). Aim for ≥4.5.",
+        low,
+        ratios.len(),
+        threshold,
+        worst
+    );
+
+    (
+        Some(contrast_score),
+        QualityFinding {
+            severity,
+            finding_type: QualityFindingType::LowContrast,
+            message,
+        },
+    )
+}
+
+fn contrast_for_dom_node(
+    node: &DomNode,
+    img: &DynamicImage,
+    view: &NormalizedView,
+) -> Option<f32> {
+    let style = node.computed_style.as_ref()?;
+    let text = style
+        .color
+        .as_deref()
+        .and_then(parse_css_color)
+        .filter(|c| c[3] >= 0.05)?;
+
+    let mut background = style
+        .background_color
+        .as_deref()
+        .and_then(parse_css_color)
+        .filter(|c| c[3] >= 0.05)
+        .map(|c| [c[0], c[1], c[2]]);
+
+    if background.is_none() {
+        background = sample_background_color(img, &node.bounding_box, view);
+    }
+
+    let background = background?;
+    let text_color = blend_over_background([text[0], text[1], text[2]], background, text[3]);
+    Some(contrast_ratio(text_color, background))
+}
+
+fn contrast_for_figma_node(
+    node: &FigmaNode,
+    img: &DynamicImage,
+    view: &NormalizedView,
+) -> Option<f32> {
+    let fill = node
+        .fills
+        .iter()
+        .find(|p| p.kind == FigmaPaintKind::Solid)
+        .and_then(|p| {
+            p.color
+                .as_deref()
+                .and_then(parse_css_color)
+                .map(|mut c| {
+                    if let Some(opacity) = p.opacity {
+                        c[3] *= opacity;
+                    }
+                    c
+                })
+        })
+        .filter(|c| c[3] >= 0.05)?;
+
+    let background = sample_background_color(img, &node.bounding_box, view)?;
+    let text_color = blend_over_background([fill[0], fill[1], fill[2]], background, fill[3]);
+    Some(contrast_ratio(text_color, background))
+}
+
+fn parse_css_color(value: &str) -> Option<[f32; 4]> {
+    let v = value.trim().to_ascii_lowercase();
+    if v == "transparent" {
+        return None;
+    }
+
+    if let Some(hex) = v.strip_prefix('#') {
+        let expanded = match hex.len() {
+            3 => hex
+                .chars()
+                .map(|c| format!("{c}{c}"))
+                .collect::<Vec<_>>()
+                .join(""),
+            6 | 8 => hex.to_string(),
+            _ => return None,
+        };
+        let r = u8::from_str_radix(&expanded[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&expanded[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&expanded[4..6], 16).ok()?;
+        let a = if expanded.len() == 8 {
+            u8::from_str_radix(&expanded[6..8], 16).ok()? as f32 / 255.0
+        } else {
+            1.0
+        };
+        return Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a]);
+    }
+
+    if let Some(body) = v.strip_prefix("rgba(").or_else(|| v.strip_prefix("rgb(")) {
+        let cleaned = body.trim_end_matches(')').replace('/', " ");
+        let parts: Vec<_> = cleaned
+            .split(|c| c == ',' || c == ' ')
+            .filter(|p| !p.trim().is_empty())
+            .collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let r: f32 = parts.get(0)?.trim().parse::<f32>().ok()? / 255.0;
+        let g: f32 = parts.get(1)?.trim().parse::<f32>().ok()? / 255.0;
+        let b: f32 = parts.get(2)?.trim().parse::<f32>().ok()? / 255.0;
+        let a: f32 = if let Some(alpha) = parts.get(3) {
+            alpha
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .map(|v| v.clamp(0.0, 1.0))
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        return Some([r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), a]);
+    }
+
+    None
+}
+
+fn contrast_ratio(fg: [f32; 3], bg: [f32; 3]) -> f32 {
+    let l1 = relative_luminance(fg);
+    let l2 = relative_luminance(bg);
+    if l1 >= l2 {
+        (l1 + 0.05) / (l2 + 0.05)
+    } else {
+        (l2 + 0.05) / (l1 + 0.05)
+    }
+}
+
+fn relative_luminance(rgb: [f32; 3]) -> f32 {
+    fn to_linear(c: f32) -> f32 {
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    let r = to_linear(rgb[0].clamp(0.0, 1.0));
+    let g = to_linear(rgb[1].clamp(0.0, 1.0));
+    let b = to_linear(rgb[2].clamp(0.0, 1.0));
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+fn blend_over_background(fg: [f32; 3], bg: [f32; 3], alpha: f32) -> [f32; 3] {
+    let a = alpha.clamp(0.0, 1.0);
+    [
+        fg[0] * a + bg[0] * (1.0 - a),
+        fg[1] * a + bg[1] * (1.0 - a),
+        fg[2] * a + bg[2] * (1.0 - a),
+    ]
+}
+
+fn sample_background_color(
+    img: &DynamicImage,
+    bbox: &BoundingBox,
+    view: &NormalizedView,
+) -> Option<[f32; 3]> {
+    let (x0, y0, w, h) = bbox_to_pixels(bbox, view.width, view.height)?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let step_x = (w / 12).max(1);
+    let step_y = (h / 12).max(1);
+
+    let mut accum = [0u64; 3];
+    let mut count = 0u64;
+    for y in (y0..y0 + h).step_by(step_y as usize) {
+        for x in (x0..x0 + w).step_by(step_x as usize) {
+            let pixel = img.get_pixel(x, y).0;
+            accum[0] += pixel[0] as u64;
+            accum[1] += pixel[1] as u64;
+            accum[2] += pixel[2] as u64;
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        None
+    } else {
+        Some([
+            accum[0] as f32 / count as f32 / 255.0,
+            accum[1] as f32 / count as f32 / 255.0,
+            accum[2] as f32 / count as f32 / 255.0,
+        ])
+    }
+}
+
+fn bbox_to_pixels(
+    bbox: &BoundingBox,
+    view_width: u32,
+    view_height: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if view_width == 0 || view_height == 0 {
+        return None;
+    }
+
+    let normalized = bbox.width <= 1.5
+        && bbox.height <= 1.5
+        && bbox.x >= 0.0
+        && bbox.x <= 1.5
+        && bbox.y >= 0.0
+        && bbox.y <= 1.5;
+
+    let x = if normalized {
+        bbox.x * view_width as f32
+    } else {
+        bbox.x
+    };
+    let y = if normalized {
+        bbox.y * view_height as f32
+    } else {
+        bbox.y
+    };
+    let mut w = if normalized {
+        bbox.width * view_width as f32
+    } else {
+        bbox.width
+    };
+    let mut h = if normalized {
+        bbox.height * view_height as f32
+    } else {
+        bbox.height
+    };
+
+    if w < 1.0 || h < 1.0 {
+        w = w.max(1.0);
+        h = h.max(1.0);
+    }
+
+    let x0 = x.max(0.0).floor() as u32;
+    let y0 = y.max(0.0).floor() as u32;
+    let x1 = (x + w).ceil().min(view_width as f32) as u32;
+    let y1 = (y + h).ceil().min(view_height as f32) as u32;
+
+    if x1 <= x0 || y1 <= y0 {
+        None
+    } else {
+        Some((x0.min(view_width - 1), y0.min(view_height - 1), x1 - x0, y1 - y0))
+    }
 }
 
 fn node_has_text(node: &DomNode) -> bool {
@@ -410,7 +824,9 @@ fn evaluate_spacing(gaps: &[f32]) -> Option<(QualityFinding, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dpc_lib::types::{BoundingBox, DomSnapshot, ResourceKind};
+    use dpc_lib::types::{BoundingBox, ComputedStyle, DomSnapshot, ResourceKind};
+    use image::{ImageBuffer, Rgba};
+    use std::collections::HashMap;
 
     fn view_with_boxes(boxes: Vec<BoundingBox>) -> NormalizedView {
         let nodes = boxes
@@ -534,6 +950,205 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f.finding_type, QualityFindingType::SpacingInconsistent)),
             "should not flag spacing when gaps are consistent and few distinct values"
+        );
+    }
+
+    fn view_with_font_sizes(sizes: &[f32]) -> NormalizedView {
+        let nodes = sizes
+            .iter()
+            .enumerate()
+            .map(|(idx, size)| DomNode {
+                id: format!("t{idx}"),
+                tag: "p".to_string(),
+                children: Vec::new(),
+                parent: None,
+                attributes: HashMap::new(),
+                text: Some(format!("Text {idx}")),
+                bounding_box: BoundingBox {
+                    x: 0.0,
+                    y: idx as f32 * 20.0,
+                    width: 50.0,
+                    height: 10.0,
+                },
+                computed_style: Some(ComputedStyle {
+                    font_size: Some(*size),
+                    ..ComputedStyle::default()
+                }),
+            })
+            .collect();
+
+        NormalizedView {
+            kind: ResourceKind::Image,
+            screenshot_path: "dummy.png".into(),
+            width: 800,
+            height: 600,
+            dom: Some(DomSnapshot {
+                url: None,
+                title: None,
+                nodes,
+            }),
+            figma_tree: None,
+            ocr_blocks: None,
+        }
+    }
+
+    #[test]
+    fn hierarchy_scores_tiered_text_higher() {
+        let tiered = view_with_font_sizes(&[32.0, 20.0, 16.0]);
+        let flat = view_with_font_sizes(&[16.0, 16.0, 16.0]);
+
+        let (tiered_score, tiered_findings) =
+            score_quality(&tiered, &Viewport { width: 800, height: 600 });
+        let (flat_score, flat_findings) =
+            score_quality(&flat, &Viewport { width: 800, height: 600 });
+
+        assert!(
+            tiered_score > flat_score,
+            "tiered text should yield a higher hierarchy score"
+        );
+        assert!(
+            flat_findings.iter().any(|f| {
+                matches!(
+                    f.finding_type,
+                    QualityFindingType::MissingHierarchy
+                ) && matches!(f.severity, FindingSeverity::Warning)
+            }),
+            "flat hierarchy should trigger a missing_hierarchy warning"
+        );
+        assert!(
+            tiered_findings
+                .iter()
+                .any(|f| matches!(f.finding_type, QualityFindingType::MissingHierarchy)),
+            "hierarchy finding should be present even when healthy"
+        );
+    }
+
+    #[test]
+    fn flags_low_contrast_text_against_background() {
+        let tmp = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("temp image");
+        let img: ImageBuffer<Rgba<u8>, _> =
+            ImageBuffer::from_pixel(120, 80, Rgba([235, 235, 235, 255]));
+        img.save(tmp.path()).unwrap();
+
+        let node = DomNode {
+            id: "text1".into(),
+            tag: "p".into(),
+            children: Vec::new(),
+            parent: None,
+            attributes: HashMap::new(),
+            text: Some("hello".into()),
+            bounding_box: BoundingBox {
+                x: 10.0,
+                y: 10.0,
+                width: 80.0,
+                height: 20.0,
+            },
+            computed_style: Some(ComputedStyle {
+                font_family: None,
+                font_size: None,
+                font_weight: None,
+                line_height: None,
+                color: Some("rgb(210, 210, 210)".to_string()),
+                background_color: None,
+                display: None,
+                visibility: None,
+                opacity: Some(1.0),
+            }),
+        };
+
+        let view = NormalizedView {
+            kind: ResourceKind::Image,
+            screenshot_path: tmp.path().to_path_buf(),
+            width: 120,
+            height: 80,
+            dom: Some(DomSnapshot {
+                url: None,
+                title: None,
+                nodes: vec![node],
+            }),
+            figma_tree: None,
+            ocr_blocks: None,
+        };
+
+        let (_score, findings) = score_quality(&view, &Viewport { width: 120, height: 80 });
+        let finding = findings
+            .iter()
+            .find(|f| matches!(f.finding_type, QualityFindingType::LowContrast))
+            .expect("low contrast finding");
+        assert!(
+            matches!(finding.severity, FindingSeverity::Warning),
+            "expected warning severity for low contrast, got {:?}",
+            finding.severity
+        );
+        assert!(
+            finding.message.to_ascii_lowercase().contains("contrast"),
+            "expected contrast context in message: {}",
+            finding.message
+        );
+    }
+
+    #[test]
+    fn treats_high_contrast_as_informational() {
+        let tmp = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("temp image");
+        let img: ImageBuffer<Rgba<u8>, _> =
+            ImageBuffer::from_pixel(100, 60, Rgba([255, 255, 255, 255]));
+        img.save(tmp.path()).unwrap();
+
+        let node = DomNode {
+            id: "text2".into(),
+            tag: "p".into(),
+            children: Vec::new(),
+            parent: None,
+            attributes: HashMap::new(),
+            text: Some("hello".into()),
+            bounding_box: BoundingBox {
+                x: 5.0,
+                y: 5.0,
+                width: 50.0,
+                height: 18.0,
+            },
+            computed_style: Some(ComputedStyle {
+                font_family: None,
+                font_size: None,
+                font_weight: None,
+                line_height: None,
+                color: Some("rgb(30, 30, 30)".to_string()),
+                background_color: None,
+                display: None,
+                visibility: None,
+                opacity: Some(1.0),
+            }),
+        };
+
+        let view = NormalizedView {
+            kind: ResourceKind::Image,
+            screenshot_path: tmp.path().to_path_buf(),
+            width: 100,
+            height: 60,
+            dom: Some(DomSnapshot {
+                url: None,
+                title: None,
+                nodes: vec![node],
+            }),
+            figma_tree: None,
+            ocr_blocks: None,
+        };
+
+        let (_score, findings) = score_quality(&view, &Viewport { width: 100, height: 60 });
+        let finding = findings
+            .iter()
+            .find(|f| matches!(f.finding_type, QualityFindingType::LowContrast))
+            .expect("low contrast finding");
+        assert!(
+            matches!(finding.severity, FindingSeverity::Info),
+            "expected informational severity for acceptable contrast, got {:?}",
+            finding.severity
         );
     }
 }
