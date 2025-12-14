@@ -55,7 +55,10 @@ pub fn render_error(err: DpcError, format: OutputFormat, output: Option<PathBuf>
 }
 
 /// Write JSON output to file or stdout.
-fn write_json_output(body: &DpcOutput, output: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+fn write_json_output(
+    body: &DpcOutput,
+    output: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let content = serde_json::to_string(body)?;
     if let Some(path) = output {
         std::fs::write(path, content)?;
@@ -158,28 +161,51 @@ pub fn format_pretty(body: &DpcOutput, colorize: bool) -> String {
             }
 
             if let Some(art) = &out.artifacts {
-                let mut paths = Vec::new();
-                paths.push(("directory", art.directory.clone()));
+                writeln!(buf, "Artifacts:").ok();
+                let retention = if art.kept {
+                    "kept"
+                } else {
+                    "cleaned up after run; use --keep-artifacts or --artifacts-dir to retain"
+                };
+                writeln!(
+                    buf,
+                    "- {:16} {} ({})",
+                    "directory",
+                    art.directory.display(),
+                    retention
+                )
+                .ok();
                 if let Some(p) = &art.ref_screenshot {
-                    paths.push(("refScreenshot", p.clone()));
+                    writeln!(buf, "- {:16} {}", "refScreenshot", p.display()).ok();
                 }
                 if let Some(p) = &art.impl_screenshot {
-                    paths.push(("implScreenshot", p.clone()));
+                    writeln!(buf, "- {:16} {}", "implScreenshot", p.display()).ok();
                 }
                 if let Some(p) = &art.diff_image {
-                    paths.push(("diffImage", p.clone()));
+                    writeln!(buf, "- {:16} {}", "diffImage", p.display()).ok();
                 }
                 if let Some(p) = &art.ref_dom_snapshot {
-                    paths.push(("refDomSnapshot", p.clone()));
+                    writeln!(buf, "- {:16} {}", "refDomSnapshot", p.display()).ok();
                 }
                 if let Some(p) = &art.impl_dom_snapshot {
-                    paths.push(("implDomSnapshot", p.clone()));
+                    writeln!(buf, "- {:16} {}", "implDomSnapshot", p.display()).ok();
                 }
-                if !paths.is_empty() {
-                    writeln!(buf, "Artifacts:").ok();
-                    for (label, path) in paths {
-                        writeln!(buf, "- {:16} {}", label, path.display()).ok();
-                    }
+                if art.kept
+                    && (art.diff_image.is_some()
+                        || art.ref_dom_snapshot.is_some()
+                        || art.impl_dom_snapshot.is_some())
+                {
+                    writeln!(
+                        buf,
+                        "Hint: open the diff heatmap or DOM snapshots in the artifacts directory for deeper inspection."
+                    )
+                    .ok();
+                } else if !art.kept {
+                    writeln!(
+                        buf,
+                        "Hint: rerun with --keep-artifacts or --artifacts-dir to retain diff heatmaps and DOM snapshots."
+                    )
+                    .ok();
                 }
             }
 
@@ -272,7 +298,9 @@ pub fn exit_code_for_compare(passed: bool) -> ExitCode {
 mod tests {
     use super::*;
     use dpc_lib::output::{CompareOutput, ResourceDescriptor, Summary};
-    use dpc_lib::types::{ColorMetric, LayoutMetric, MetricScores, PixelMetric, ResourceKind, Viewport};
+    use dpc_lib::types::{
+        ColorMetric, LayoutMetric, MetricScores, PixelMetric, ResourceKind, Viewport,
+    };
     use dpc_lib::CompareArtifacts;
     use std::path::PathBuf;
 
@@ -353,6 +381,8 @@ mod tests {
         assert!(pretty.contains("layout") && pretty.contains("0.75"));
         assert!(pretty.contains("color") && pretty.contains("0.80"));
         assert!(pretty.contains("Artifacts:"));
+        assert!(pretty.contains("(kept)"));
+        assert!(pretty.contains("Hint: open the diff heatmap"));
         assert!(pretty.contains("refScreenshot"));
     }
 

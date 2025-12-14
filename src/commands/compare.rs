@@ -5,8 +5,8 @@ use std::sync::Arc;
 use dpc_lib::output::DPC_OUTPUT_VERSION;
 use dpc_lib::types::ResourceKind;
 use dpc_lib::{
-    calculate_combined_score, default_metrics, parse_resource, run_metrics,
-    CompareOutput, DpcError, DpcOutput, MetricKind, ResourceDescriptor, Viewport,
+    calculate_combined_score, default_metrics, parse_resource, run_metrics, CompareOutput,
+    DpcError, DpcOutput, MetricKind, ResourceDescriptor, Viewport,
 };
 
 use crate::cli::OutputFormat;
@@ -17,8 +17,8 @@ use crate::pipeline::{
     resource_to_normalized_view,
 };
 use crate::settings::{
-    format_effective_config, load_config, resolve_compare_settings, CompareFlagSources,
-    log_effective_config,
+    format_effective_config, load_config, log_effective_config, resolve_compare_settings,
+    CompareFlagSources,
 };
 
 /// Run the compare command.
@@ -95,22 +95,16 @@ pub async fn run_compare(
 
     let ref_res = match parse_resource(&r#ref, ref_type.map(resource_kind_from_cli)) {
         Ok(res) => res,
-        Err(err) => {
-            return render_error(DpcError::Config(err.to_string()), format, output.clone())
-        }
+        Err(err) => return render_error(DpcError::Config(err.to_string()), format, output.clone()),
     };
     let impl_res = match parse_resource(&r#impl, impl_type.map(resource_kind_from_cli)) {
         Ok(res) => res,
-        Err(err) => {
-            return render_error(DpcError::Config(err.to_string()), format, output.clone())
-        }
+        Err(err) => return render_error(DpcError::Config(err.to_string()), format, output.clone()),
     };
 
     let selected_metrics = match parse_metric_kinds(metrics.as_deref()) {
         Ok(k) => k,
-        Err(err) => {
-            return render_error(DpcError::Config(err.to_string()), format, output.clone())
-        }
+        Err(err) => return render_error(DpcError::Config(err.to_string()), format, output.clone()),
     };
     let ignore_selectors = parse_ignore_selectors(ignore_selectors.as_deref());
     let ignore_regions = match ignore_regions {
@@ -238,65 +232,65 @@ pub async fn run_compare(
     // Generate summary
     let summary = generate_summary(&metrics_scores, similarity, threshold as f32);
 
-    let artifacts = if should_keep_artifacts {
-        match persist_compare_artifacts(
-            &artifacts_dir,
-            &ref_view,
-            &impl_view,
-            should_keep_artifacts,
-        ) {
-            Ok(paths) => Some(paths),
-            Err(err) => return render_error(err, format, output.clone()),
-        }
-    } else {
-        None
+    let artifacts = match persist_compare_artifacts(
+        &artifacts_dir,
+        &ref_view,
+        &impl_view,
+        should_keep_artifacts,
+    ) {
+        Ok(paths) => paths,
+        Err(err) => return render_error(err, format, output.clone()),
     };
 
-    if should_keep_artifacts {
-        eprintln!("Artifacts saved to: {}", artifacts_dir.display());
+    let retention_note = if artifacts.kept {
+        "kept"
+    } else {
+        "cleaned up after run; pass --keep-artifacts or --artifacts-dir to retain"
+    };
+    eprintln!(
+        "Artifacts directory: {} ({})",
+        artifacts.directory.display(),
+        retention_note
+    );
+    if artifacts.kept {
+        eprintln!(
+            "Hint: open diff_heatmap.png or DOM snapshots in the artifacts directory for deeper inspection."
+        );
+    } else {
+        eprintln!(
+            "Hint: rerun with --keep-artifacts or --artifacts-dir to capture diff heatmaps and DOM snapshots."
+        );
     }
 
     if verbose {
-        if let Some(paths) = &artifacts {
+        eprintln!("Artifacts (kept: {}):", artifacts.kept);
+        eprintln!("  directory: {}", artifacts.directory.display());
+        if let Some(path) = &artifacts.ref_screenshot {
+            eprintln!("  ref screenshot: {}", path.display());
+        }
+        if let Some(path) = &artifacts.impl_screenshot {
+            eprintln!("  impl screenshot: {}", path.display());
+        }
+        if let Some(path) = &artifacts.ref_dom_snapshot {
+            eprintln!("  ref DOM: {}", path.display());
+        }
+        if let Some(path) = &artifacts.impl_dom_snapshot {
+            eprintln!("  impl DOM: {}", path.display());
+        }
+        if let Some(path) = &artifacts.ref_figma_snapshot {
+            eprintln!("  ref figma tree: {}", path.display());
+        }
+        if let Some(path) = &artifacts.impl_figma_snapshot {
+            eprintln!("  impl figma tree: {}", path.display());
+        }
+        if let Some(path) = &artifacts.diff_image {
+            eprintln!("  pixel diff: {}", path.display());
+        } else if artifacts.kept {
+            eprintln!("  pixel diff: not generated");
+        }
+        if !artifacts.kept {
             eprintln!(
-                "Artifacts directory: {} (kept: {})",
-                paths.directory.display(),
-                paths.kept
-            );
-            if let Some(path) = &paths.ref_screenshot {
-                eprintln!("  ref screenshot: {}", path.display());
-            }
-            if let Some(path) = &paths.impl_screenshot {
-                eprintln!("  impl screenshot: {}", path.display());
-            }
-            if let Some(path) = &paths.ref_dom_snapshot {
-                eprintln!("  ref DOM: {}", path.display());
-            }
-            if let Some(path) = &paths.impl_dom_snapshot {
-                eprintln!("  impl DOM: {}", path.display());
-            }
-            if let Some(path) = &paths.ref_figma_snapshot {
-                eprintln!("  ref figma tree: {}", path.display());
-            }
-            if let Some(path) = &paths.impl_figma_snapshot {
-                eprintln!("  impl figma tree: {}", path.display());
-            }
-            if paths.diff_image.is_some() {
-                if let Some(path) = &paths.diff_image {
-                    eprintln!("  pixel diff: {}", path.display());
-                }
-            } else {
-                eprintln!("  pixel diff: not generated");
-            }
-            if !paths.kept {
-                eprintln!(
-                    "Artifacts will be cleaned up; pass --keep-artifacts or --artifacts-dir to retain."
-                );
-            }
-        } else {
-            eprintln!(
-                "Artifacts directory: {} (will be cleaned up; use --keep-artifacts or --artifacts-dir to retain)",
-                artifacts_dir.display()
+                "Artifacts will be cleaned up; pass --keep-artifacts or --artifacts-dir to retain."
             );
         }
     }
@@ -317,7 +311,7 @@ pub async fn run_compare(
         passed,
         metrics: metrics_scores,
         summary: Some(summary),
-        artifacts,
+        artifacts: Some(artifacts.clone()),
     });
 
     if let Err(err) = write_output(&body, format, output.clone()) {
@@ -325,8 +319,8 @@ pub async fn run_compare(
     }
 
     // Cleanup artifacts unless --keep-artifacts is set
-    if !should_keep_artifacts {
-        let _ = std::fs::remove_dir_all(&artifacts_dir);
+    if !artifacts.kept {
+        let _ = std::fs::remove_dir_all(&artifacts.directory);
     }
 
     exit_code_for_compare(passed)
