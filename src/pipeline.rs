@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use dpc_lib::types::{DomNode, MetricScores, ResourceKind, Viewport};
 use dpc_lib::{
-    figma_to_normalized_view, image_to_normalized_view, url_to_normalized_view,
-    CompareArtifacts, DpcError, FigmaAuth, FigmaClient, FigmaRenderOptions,
-    ImageLoadOptions, NormalizedView, ParsedResource, Summary, UrlToViewOptions,
+    figma_to_normalized_view, image_to_normalized_view, url_to_normalized_view, CompareArtifacts,
+    DpcError, FigmaAuth, FigmaClient, FigmaRenderOptions, ImageLoadOptions, NormalizedView,
+    ParsedResource, Summary, UrlToViewOptions,
 };
 
 /// Convert a parsed resource to a NormalizedView.
@@ -32,6 +32,8 @@ pub async fn resource_to_normalized_view(
                 no_resize: false,
                 target_width: Some(viewport.width),
                 target_height: Some(viewport.height),
+                enable_ocr: true,
+                ..Default::default()
             };
             let view = image_to_normalized_view(
                 mock_path.as_str(),
@@ -50,6 +52,8 @@ pub async fn resource_to_normalized_view(
                 no_resize: false,
                 target_width: Some(viewport.width),
                 target_height: Some(viewport.height),
+                enable_ocr: true,
+                ..Default::default()
             };
             let view = image_to_normalized_view(
                 resource.value.as_str(),

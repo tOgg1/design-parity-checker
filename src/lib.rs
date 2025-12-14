@@ -41,6 +41,7 @@ pub mod figma;
 pub mod figma_client;
 pub mod image_loader;
 pub mod metrics;
+pub mod ocr;
 pub mod output;
 pub mod resource;
 pub mod types;
@@ -58,23 +59,37 @@ pub use figma_client::{
     FigmaApiClient, FigmaAuth, FigmaFileResponse, FigmaImageFormat, FigmaImageResponse,
     FigmaNodesResponse, ImageExportOptions,
 };
-pub use image_loader::{image_to_normalized_view, load_image, ImageLoadOptions};
+pub use image_loader::{
+    extract_ocr_for_view, image_to_normalized_view, load_image, ImageLoadOptions,
+};
 // Metrics module re-exports
 pub use metrics::{
     // Core traits and types
-    calculate_combined_score, default_metrics, generate_top_issues, run_metrics, Metric,
-    MetricKind, MetricResult, ScoreWeights,
+    calculate_combined_score,
     // Concrete metric implementations (for custom configuration)
-    cluster_diff_regions, ColorPaletteMetric, ContentSimilarity, LayoutSimilarity,
-    PixelDiffThresholds, PixelSimilarity, TypographySimilarity,
+    cluster_diff_regions,
+    default_metrics,
+    generate_top_issues,
+    run_metrics,
+    ColorPaletteMetric,
+    ContentSimilarity,
+    LayoutSimilarity,
+    Metric,
+    MetricKind,
+    MetricResult,
+    PixelDiffThresholds,
+    PixelSimilarity,
+    ScoreWeights,
+    TypographySimilarity,
 };
 pub use output::{
     CompareArtifacts, CompareOutput, DpcOutput, ErrorOutput, FindingSeverity, GenerateCodeOutput,
     QualityFinding, QualityOutput, ResourceDescriptor, Summary, DPC_OUTPUT_VERSION,
 };
+pub use ocr::{extract_text_blocks, is_available as ocr_is_available, OcrError, OcrOptions};
 pub use resource::{parse_resource, FigmaInfo, ParsedResource};
 pub use types::{
-    ColorMetric, ContentMetric, LayoutMetric, MetricScores, NormalizedView, PixelMetric,
-    ResourceKind, TypographyMetric,
+    BoundingBox, ColorMetric, ContentMetric, LayoutMetric, MetricScores, NormalizedView,
+    OcrBlock, PixelMetric, ResourceKind, TypographyMetric,
 };
 pub use viewport::Viewport;

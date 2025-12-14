@@ -4,7 +4,8 @@ use std::path::Path;
 use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageError};
 use thiserror::Error;
 
-use crate::types::{NormalizedView, ResourceKind};
+use crate::ocr::{self, OcrOptions};
+use crate::types::{NormalizedView, OcrBlock, ResourceKind};
 
 #[derive(Debug, Error)]
 pub enum ImageLoadError {
@@ -14,13 +15,17 @@ pub enum ImageLoadError {
     NotFound(String),
     #[error("Failed to save normalized image: {0}")]
     Save(String),
+    #[error("OCR extraction failed: {0}")]
+    Ocr(String),
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ImageLoadOptions {
     pub no_resize: bool,
     pub target_width: Option<u32>,
     pub target_height: Option<u32>,
+    pub enable_ocr: bool,
+    pub ocr_options: Option<OcrOptions>,
 }
 
 pub fn load_image(path: &str) -> Result<DynamicImage, ImageLoadError> {
@@ -57,6 +62,17 @@ pub fn image_to_normalized_view(
         .save(out_path)
         .map_err(|e| ImageLoadError::Save(e.to_string()))?;
 
+    let ocr_blocks = if options.enable_ocr {
+        let ocr_opts = options.ocr_options.clone().unwrap_or_default();
+        match ocr::extract_text_blocks(out_path, &ocr_opts) {
+            Ok(blocks) => Some(blocks),
+            Err(ocr::OcrError::NotAvailable) => None,
+            Err(e) => return Err(ImageLoadError::Ocr(e.to_string())),
+        }
+    } else {
+        None
+    };
+
     Ok(NormalizedView {
         kind: ResourceKind::Image,
         screenshot_path: out_path.to_path_buf(),
@@ -64,8 +80,20 @@ pub fn image_to_normalized_view(
         height,
         dom: None,
         figma_tree: None,
-        ocr_blocks: None,
+        ocr_blocks,
     })
+}
+
+/// Extract OCR text from an existing NormalizedView's screenshot.
+///
+/// This can be used to add OCR data to a view that was created without OCR,
+/// or to re-run OCR with different options.
+pub fn extract_ocr_for_view(
+    view: &NormalizedView,
+    options: &OcrOptions,
+) -> Result<Vec<OcrBlock>, ImageLoadError> {
+    ocr::extract_text_blocks(&view.screenshot_path, options)
+        .map_err(|e| ImageLoadError::Ocr(e.to_string()))
 }
 
 pub fn resize_with_letterbox(
@@ -164,6 +192,7 @@ mod tests {
                 no_resize: false,
                 target_width: Some(40),
                 target_height: Some(20),
+                ..Default::default()
             },
         )
         .expect("normalize with resize");
@@ -174,5 +203,54 @@ mod tests {
 
         let saved = image::open(&output_path).expect("open saved image");
         assert_eq!(saved.dimensions(), (40, 20));
+    }
+
+    #[test]
+    fn image_to_normalized_view_with_ocr_disabled_has_no_blocks() {
+        let dir = TempDir::new().expect("tempdir");
+        let input_path = dir.path().join("input_no_ocr.png");
+        let output_path = dir.path().join("output_no_ocr.png");
+
+        let img = RgbaImage::from_pixel(10, 5, image::Rgba([255, 0, 0, 255]));
+        img.save(&input_path).expect("write input image");
+
+        let view = image_to_normalized_view(
+            input_path.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+            ImageLoadOptions {
+                no_resize: true,
+                enable_ocr: false,
+                ..Default::default()
+            },
+        )
+        .expect("normalize image");
+
+        assert!(view.ocr_blocks.is_none(), "OCR should not run when disabled");
+    }
+
+    #[test]
+    fn image_to_normalized_view_with_ocr_enabled_gracefully_handles_unavailable() {
+        let dir = TempDir::new().expect("tempdir");
+        let input_path = dir.path().join("input_ocr.png");
+        let output_path = dir.path().join("output_ocr.png");
+
+        let img = RgbaImage::from_pixel(10, 5, image::Rgba([255, 0, 0, 255]));
+        img.save(&input_path).expect("write input image");
+
+        let view = image_to_normalized_view(
+            input_path.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+            ImageLoadOptions {
+                no_resize: true,
+                enable_ocr: true,
+                ..Default::default()
+            },
+        )
+        .expect("should succeed even when OCR unavailable");
+
+        // When OCR feature is not compiled, ocr_blocks should be None
+        // When OCR is compiled but tessdata is missing, it may error or return None
+        // This test just ensures no panic occurs
+        assert!(output_path.exists());
     }
 }
