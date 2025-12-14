@@ -410,7 +410,7 @@ fn evaluate_spacing(gaps: &[f32]) -> Option<(QualityFinding, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dpc_lib::types::{DomSnapshot, ResourceKind};
+    use dpc_lib::types::{BoundingBox, DomSnapshot, ResourceKind};
 
     fn view_with_boxes(boxes: Vec<BoundingBox>) -> NormalizedView {
         let nodes = boxes
@@ -460,27 +460,33 @@ mod tests {
             },
             BoundingBox {
                 x: 0.2,
-                y: 0.32,
+                y: 0.27,
                 width: 0.2,
                 height: 0.1,
             },
             BoundingBox {
                 x: 0.05,
-                y: 0.5,
+                y: 0.42,
                 width: 0.2,
                 height: 0.1,
             },
             BoundingBox {
                 x: 0.05,
-                y: 0.68,
+                y: 0.6,
                 width: 0.2,
                 height: 0.1,
             },
             BoundingBox {
                 x: 0.05,
-                y: 0.87,
+                y: 0.8,
                 width: 0.2,
                 height: 0.1,
+            },
+            BoundingBox {
+                x: 0.05,
+                y: 0.93,
+                width: 0.2,
+                height: 0.05,
             },
         ]);
 
