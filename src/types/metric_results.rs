@@ -10,8 +10,36 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::types::core::BoundingBox;
+
+/// Represents the results of the Hierarchy metric.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HierarchyMetric {
+    pub score: f64,
+    pub issues: Vec<HierarchyIssue>,
+    pub distinct_tiers: Vec<f64>, // List of distinct font sizes found
+    pub tier_count: usize,       // Number of distinct tiers
+}
+
+/// Represents an issue found by the Hierarchy metric.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HierarchyIssue {
+    /// Too many distinct font size tiers detected, indicating lack of clear hierarchy.
+    TooManyTiers(usize),
+    /// Too few distinct font size tiers detected, indicating insufficient hierarchy.
+    TooFewTiers(usize),
+    /// A text element has an unusual font size that doesn't fit into established tiers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    UnusualFontSize {
+        font_size: f64,
+        element_text: Option<String>,
+        bounding_box: BoundingBox,
+    },
+}
+
 /// Container for all metric scores.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricScores {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -24,6 +52,8 @@ pub struct MetricScores {
     pub color: Option<ColorMetric>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<ContentMetric>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hierarchy: Option<HierarchyMetric>, // New field for HierarchyMetric
 }
 
 // ============================================================================
@@ -85,11 +115,8 @@ pub enum PixelDiffReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LayoutMetric {
-    /// Similarity score (0.0 - 1.0)
-    pub score: f32,
-    /// Regions with layout differences
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diff_regions: Vec<LayoutDiffRegion>,
+    pub score: f64,
+    pub issues: Vec<LayoutIssue>,
 }
 
 /// A layout difference region.
@@ -118,6 +145,34 @@ pub enum LayoutDiffKind {
     SizeChange,
 }
 
+/// Represents an issue found by the Layout metric.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LayoutIssue {
+    /// An element present in the reference is missing in the implementation.
+    MissingElement {
+        element_type: Option<String>,
+        bounding_box: BoundingBox,
+    },
+    /// An element present in the implementation is not found in the reference.
+    ExtraElement {
+        element_type: Option<String>,
+        bounding_box: BoundingBox,
+    },
+    /// An element has significantly shifted position.
+    PositionShift {
+        element_type: Option<String>,
+        ref_box: BoundingBox,
+        impl_box: BoundingBox,
+    },
+    /// An element has significantly changed size.
+    SizeChange {
+        element_type: Option<String>,
+        ref_box: BoundingBox,
+        impl_box: BoundingBox,
+    },
+}
+
 // ============================================================================
 // Typography Metric Types
 // ============================================================================
@@ -126,36 +181,20 @@ pub enum LayoutDiffKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TypographyMetric {
-    /// Similarity score (0.0 - 1.0)
-    pub score: f32,
-    /// Typography differences found
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diffs: Vec<TypographyDiff>,
-}
-
-/// A typography difference between elements.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TypographyDiff {
-    /// Element ID in reference
-    pub element_id_ref: Option<String>,
-    /// Element ID in implementation
-    pub element_id_impl: Option<String>,
-    /// List of typography issues
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub score: f64,
     pub issues: Vec<TypographyIssue>,
-    /// Additional details (ref/impl values)
-    pub details: Option<Value>,
 }
 
-/// Type of typography issue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Represents an issue found by the Typography metric.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypographyIssue {
     FontFamilyMismatch,
     FontSizeDiff,
     FontWeightDiff,
     LineHeightDiff,
+    LetterSpacingDiff,
+    TextAlignDiff,
 }
 
 // ============================================================================
@@ -166,34 +205,37 @@ pub enum TypographyIssue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColorMetric {
-    /// Similarity score (0.0 - 1.0)
-    pub score: f32,
-    /// Color differences found
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diffs: Vec<ColorDiff>,
+    pub score: f64,
+    pub issues: Vec<ColorIssue>,
 }
 
-/// A color difference between palettes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Represents an issue found by the Color metric.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ColorDiff {
-    /// Type of color shift
-    pub kind: ColorDiffKind,
-    /// Reference color (hex)
-    pub ref_color: String,
-    /// Implementation color (hex)
-    pub impl_color: String,
-    /// Delta E (perceptual difference)
-    pub delta_e: Option<f32>,
-}
-
-/// Type of color difference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ColorDiffKind {
-    PrimaryColorShift,
-    AccentColorShift,
-    BackgroundColorShift,
+pub enum ColorIssue {
+    /// A primary color in the reference palette is missing or significantly shifted in the implementation.
+    PrimaryColorShift {
+        ref_color: String,
+        impl_color: Option<String>,
+        delta_e: Option<f32>,
+    },
+    /// An accent color in the reference palette is missing or significantly shifted in the implementation.
+    AccentColorShift {
+        ref_color: String,
+        impl_color: Option<String>,
+        delta_e: Option<f32>,
+    },
+    /// A background color in the reference palette is missing or significantly shifted in the implementation.
+    BackgroundColorShift {
+        ref_color: String,
+        impl_color: Option<String>,
+        delta_e: Option<f32>,
+    },
+    /// The overall number of colors in the implementation deviates significantly from the reference.
+    PaletteCountMismatch {
+        ref_count: usize,
+        impl_count: usize,
+    },
 }
 
 // ============================================================================
@@ -204,12 +246,29 @@ pub enum ColorDiffKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentMetric {
-    /// Similarity score (0.0 - 1.0)
-    pub score: f32,
-    /// Text present in reference but missing in implementation
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub missing_text: Vec<String>,
-    /// Text present in implementation but not in reference
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extra_text: Vec<String>,
+    pub score: f64,
+    pub issues: Vec<ContentIssue>,
+}
+
+/// Represents an issue found by the Content metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentIssue {
+    MissingText,
+    ExtraText,
+}
+
+// ============================================================================
+// MetricResult Enum
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)] // To allow for flexible deserialization
+pub enum MetricResult {
+    Pixel(PixelMetric),
+    Layout(LayoutMetric),
+    Typography(TypographyMetric),
+    Color(ColorMetric),
+    Content(ContentMetric),
+    Hierarchy(HierarchyMetric),
 }
