@@ -1,0 +1,37 @@
+[package]
+name = "dpc"
+version = "0.1.0"
+edition = "2021"
+description = "Design Parity Checker - Compare implementations against design references"
+license = "MIT"
+repository = "https://github.com/user/design-parity-checker"
+keywords = ["design", "parity", "visual-regression", "figma", "testing"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "dpc"
+path = "src/main.rs"
+
+[lib]
+name = "dpc_lib"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = "0.25"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+anyhow = "1"
+reqwest = { version = "0.12", features = ["json"] }
+url = "2"
+palette = "0.7"
+playwright = "0.0.20"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
