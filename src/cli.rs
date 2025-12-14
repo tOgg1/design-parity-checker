@@ -21,7 +21,7 @@ pub struct Cli {
         long,
         global = true,
         value_name = "PATH",
-        help = "Optional config file (TOML) to set defaults for viewport/threshold/weights/timeouts"
+        help = "Optional config file (TOML) to set defaults for viewport/threshold/weights/timeouts; CLI flags override config"
     )]
     pub config: Option<PathBuf>,
 }

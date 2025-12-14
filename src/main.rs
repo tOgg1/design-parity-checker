@@ -16,8 +16,8 @@ use dpc_lib::types::{MetricScores, ResourceKind};
 use dpc_lib::NormalizedView;
 use dpc_lib::{
     calculate_combined_score, default_metrics, figma_to_normalized_view, image_to_normalized_view,
-    parse_resource, run_metrics, url_to_normalized_view, CompareArtifacts, CompareOutput, DpcError,
-    DpcOutput, ErrorOutput, FigmaAuth, FigmaClient, FigmaRenderOptions, FindingSeverity,
+    parse_resource, run_metrics, url_to_normalized_view, CompareArtifacts, CompareOutput, Config,
+    DpcError, DpcOutput, ErrorOutput, FigmaAuth, FigmaClient, FigmaRenderOptions, FindingSeverity,
     GenerateCodeOutput, ImageLoadOptions, MetricKind, ParsedResource, QualityFinding,
     QualityOutput, ResourceDescriptor, ScoreWeights, Summary, UrlToViewOptions, Viewport,
 };
@@ -30,6 +30,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> ExitCode {
+    let raw_args: Vec<String> = std::env::args().collect();
     let args = cli::parse();
 
     match args.command {
@@ -52,7 +53,51 @@ async fn run() -> ExitCode {
             process_timeout,
             ..
         } => {
+            let config = match load_config(args.config.as_deref()) {
+                Ok(cfg) => cfg,
+                Err(err) => return render_error(err, format, output.clone()),
+            };
+            let config_source = args.config.as_deref();
+            let flag_sources = CompareFlagSources::from_args(&raw_args);
+            let resolved = resolve_compare_settings(
+                viewport,
+                threshold,
+                nav_timeout,
+                network_idle_timeout,
+                process_timeout,
+                &config,
+                &flag_sources,
+            );
+            let viewport = resolved.viewport;
+            let threshold = resolved.threshold;
+            let nav_timeout = resolved.nav_timeout;
+            let network_idle_timeout = resolved.network_idle_timeout;
+            let process_timeout = resolved.process_timeout;
+            let score_weights = resolved.weights;
             if args.verbose {
+                log_effective_config(
+                    args.config.as_deref(),
+                    &viewport,
+                    threshold,
+                    &score_weights,
+                    nav_timeout,
+                    network_idle_timeout,
+                    process_timeout,
+                );
+            }
+            if args.verbose {
+                eprintln!(
+                    "{}",
+                    format_effective_config(
+                        &viewport,
+                        threshold,
+                        nav_timeout,
+                        network_idle_timeout,
+                        process_timeout,
+                        &score_weights,
+                        config_source
+                    )
+                );
                 eprintln!("Parsing resources…");
             }
             let ref_res = match parse_resource(&r#ref, ref_type.map(resource_kind_from_cli)) {
@@ -194,8 +239,7 @@ async fn run() -> ExitCode {
                 };
 
             // Calculate combined score
-            let weights = ScoreWeights::default();
-            let similarity = calculate_combined_score(&metrics_scores, &weights);
+            let similarity = calculate_combined_score(&metrics_scores, &score_weights);
 
             // Determine pass/fail
             let passed = similarity >= threshold as f32;
@@ -302,6 +346,15 @@ async fn run() -> ExitCode {
             output,
             format,
         } => {
+            let config = match load_config(args.config.as_deref()) {
+                Ok(cfg) => cfg,
+                Err(err) => return render_error(err, format, output.clone()),
+            };
+            let viewport = if flag_present(&raw_args, "--viewport") {
+                viewport
+            } else {
+                config.viewport
+            };
             if args.verbose {
                 eprintln!("Parsing input resource…");
             }
@@ -330,7 +383,12 @@ async fn run() -> ExitCode {
                 code: None,
                 summary: Some(Summary {
                     top_issues: vec![
-                        "generate-code is not implemented yet; use an external screenshot-to-code service or mock outputs for now.".to_string(),
+                        String::from(
+                            "Not implemented: generate-code will return code later; for now, use an external screenshot-to-code service and run `dpc compare` for parity checks.",
+                        ),
+                        String::from(
+                            "Next steps: keep artifacts with --keep-artifacts/--artifacts-dir for handoff to codegen tools.",
+                        ),
                     ],
                 }),
             });
@@ -346,6 +404,15 @@ async fn run() -> ExitCode {
             format,
             output,
         } => {
+            let config = match load_config(args.config.as_deref()) {
+                Ok(cfg) => cfg,
+                Err(err) => return render_error(err, format, output.clone()),
+            };
+            let viewport = if flag_present(&raw_args, "--viewport") {
+                viewport
+            } else {
+                config.viewport
+            };
             if args.verbose {
                 eprintln!("Parsing input resource…");
             }
@@ -369,11 +436,18 @@ async fn run() -> ExitCode {
                 },
                 viewport,
                 score: 0.0,
-                findings: vec![QualityFinding {
-                    severity: FindingSeverity::Info,
-                    finding_type: "not_implemented".to_string(),
-                    message: "Quality mode is not implemented yet; run compare for parity checks or stub quality scoring.".to_string(),
-                }],
+                findings: vec![
+                    QualityFinding {
+                        severity: FindingSeverity::Info,
+                        finding_type: "not_implemented".to_string(),
+                        message: "Not implemented: quality scoring is coming soon; use `dpc compare` for parity checks and track findings manually.".to_string(),
+                    },
+                    QualityFinding {
+                        severity: FindingSeverity::Info,
+                        finding_type: "next_steps".to_string(),
+                        message: "Use mocks or artifacts to gather context: --keep-artifacts/--artifacts-dir retains screenshots/DOM for manual review.".to_string(),
+                    },
+                ],
             });
             if let Err(err) = write_output(&body, format, output.clone()) {
                 return render_error(DpcError::Config(err.to_string()), format, output);
@@ -381,6 +455,132 @@ async fn run() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+fn load_config(path: Option<&Path>) -> Result<Config, DpcError> {
+    let cfg = if let Some(p) = path {
+        Config::from_toml_file(p).map_err(|e| {
+            DpcError::Config(format!("Failed to read config {}: {}", p.display(), e))
+        })?
+    } else {
+        Config::default()
+    };
+
+    cfg.validate()
+        .map_err(|e| DpcError::Config(format!("Invalid config: {}", e)))?;
+    Ok(cfg)
+}
+
+#[derive(Debug, Default)]
+struct CompareFlagSources {
+    viewport: bool,
+    threshold: bool,
+    nav_timeout: bool,
+    network_idle_timeout: bool,
+    process_timeout: bool,
+}
+
+impl CompareFlagSources {
+    fn from_args(args: &[String]) -> Self {
+        Self {
+            viewport: flag_present(args, "--viewport"),
+            threshold: flag_present(args, "--threshold"),
+            nav_timeout: flag_present(args, "--nav-timeout"),
+            network_idle_timeout: flag_present(args, "--network-idle-timeout"),
+            process_timeout: flag_present(args, "--process-timeout"),
+        }
+    }
+}
+
+fn flag_present(args: &[String], flag: &str) -> bool {
+    args.iter()
+        .any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedCompareSettings {
+    viewport: Viewport,
+    threshold: f64,
+    nav_timeout: u64,
+    network_idle_timeout: u64,
+    process_timeout: u64,
+    weights: ScoreWeights,
+}
+
+fn resolve_compare_settings(
+    cli_viewport: Viewport,
+    cli_threshold: f64,
+    cli_nav_timeout: u64,
+    cli_network_idle_timeout: u64,
+    cli_process_timeout: u64,
+    config: &Config,
+    flags: &CompareFlagSources,
+) -> ResolvedCompareSettings {
+    let weights = ScoreWeights {
+        pixel: config.metric_weights.pixel,
+        layout: config.metric_weights.layout,
+        typography: config.metric_weights.typography,
+        color: config.metric_weights.color,
+        content: config.metric_weights.content,
+    };
+
+    ResolvedCompareSettings {
+        viewport: if flags.viewport {
+            cli_viewport
+        } else {
+            config.viewport
+        },
+        threshold: if flags.threshold {
+            cli_threshold
+        } else {
+            config.threshold
+        },
+        nav_timeout: if flags.nav_timeout {
+            cli_nav_timeout
+        } else {
+            config.timeouts.navigation.as_secs()
+        },
+        network_idle_timeout: if flags.network_idle_timeout {
+            cli_network_idle_timeout
+        } else {
+            config.timeouts.network_idle.as_secs()
+        },
+        process_timeout: if flags.process_timeout {
+            cli_process_timeout
+        } else {
+            config.timeouts.process.as_secs()
+        },
+        weights,
+    }
+}
+
+fn log_effective_config(
+    config_path: Option<&Path>,
+    viewport: &Viewport,
+    threshold: f64,
+    weights: &ScoreWeights,
+    nav_timeout: u64,
+    network_idle_timeout: u64,
+    process_timeout: u64,
+) {
+    let config_source = config_path
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "defaults/built-in".to_string());
+    eprintln!(
+        "Effective config (source: {}): viewport {}x{}, threshold {:.2}, timeouts nav {}s / idle {}s / process {}s, weights pixel {:.2}, layout {:.2}, typography {:.2}, color {:.2}, content {:.2}",
+        config_source,
+        viewport.width,
+        viewport.height,
+        threshold,
+        nav_timeout,
+        network_idle_timeout,
+        process_timeout,
+        weights.pixel,
+        weights.layout,
+        weights.typography,
+        weights.color,
+        weights.content
+    );
 }
 
 async fn resource_to_normalized_view(
@@ -454,8 +654,8 @@ async fn resource_to_normalized_view(
                     "Figma token missing; set FIGMA_TOKEN or FIGMA_OAUTH_TOKEN".to_string(),
                 )
             })?;
-            let client = FigmaClient::from_auth(auth)
-                .map_err(|e| format!("Figma client error: {}", e))?;
+            let client =
+                FigmaClient::from_auth(auth).map_err(|e| format!("Figma client error: {}", e))?;
             let output_path = artifacts_dir.join(format!("{}_figma.png", prefix));
             let options = FigmaRenderOptions {
                 file_key: figma_info.file_key.clone(),
@@ -994,7 +1194,10 @@ fn render_error(err: DpcError, format: OutputFormat, output: Option<PathBuf>) ->
     ExitCode::from(2)
 }
 
-fn write_json_output(body: &DpcOutput, output: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+fn write_json_output(
+    body: &DpcOutput,
+    output: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let content = serde_json::to_string(body)?;
     if let Some(path) = output {
         std::fs::write(path, content)?;
@@ -1026,12 +1229,30 @@ fn write_pretty_output(body: &DpcOutput, output: Option<&Path>) -> io::Result<()
 }
 
 fn format_pretty(body: &DpcOutput, colorize: bool) -> String {
+    let format_score = |score: f32, threshold: Option<f32>| {
+        let pct = score * 100.0;
+        let text = format!("{:.3}", score);
+        let code = if let Some(th) = threshold {
+            if score >= th {
+                "32"
+            } else if (th - score) <= 0.05 {
+                "33"
+            } else {
+                "31"
+            }
+        } else {
+            score_color_code(score)
+        };
+        let pct_text = format!("{} ({:.1}%)", text, pct);
+        color(&pct_text, code, colorize)
+    };
+
     match body {
         DpcOutput::Compare(out) => {
             let mut buf = String::new();
             let status = if out.passed { "PASS" } else { "FAIL" };
             let status_colored = color(status, if out.passed { "32" } else { "31" }, colorize);
-            let similarity = format!("{:.1}%", out.similarity * 100.0);
+            let similarity = format_score(out.similarity, Some(out.threshold));
             let threshold = format!("{:.1}%", out.threshold * 100.0);
             let header = format!("{} Design parity check", status_colored);
             writeln!(buf, "{header}").ok();
@@ -1052,26 +1273,27 @@ fn format_pretty(body: &DpcOutput, colorize: bool) -> String {
                 }
             }
 
-            let mut metrics = Vec::new();
+            let mut metrics: Vec<(&str, f32)> = Vec::new();
             if let Some(pixel) = &out.metrics.pixel {
-                metrics.push(("pixel", format!("{:.3}", pixel.score)));
+                metrics.push(("pixel", pixel.score));
             }
             if let Some(layout) = &out.metrics.layout {
-                metrics.push(("layout", format!("{:.3}", layout.score)));
+                metrics.push(("layout", layout.score));
             }
             if let Some(typography) = &out.metrics.typography {
-                metrics.push(("typography", format!("{:.3}", typography.score)));
+                metrics.push(("typography", typography.score));
             }
             if let Some(color_metric) = &out.metrics.color {
-                metrics.push(("color", format!("{:.3}", color_metric.score)));
+                metrics.push(("color", color_metric.score));
             }
             if let Some(content) = &out.metrics.content {
-                metrics.push(("content", format!("{:.3}", content.score)));
+                metrics.push(("content", content.score));
             }
             if !metrics.is_empty() {
                 writeln!(buf, "Metrics:").ok();
                 for (name, score) in metrics {
-                    writeln!(buf, "- {:12} {}", name, score).ok();
+                    let styled = format_score(score, None);
+                    writeln!(buf, "- {:12} {}", name, styled).ok();
                 }
             }
 
@@ -1164,6 +1386,44 @@ fn color(text: &str, code: &str, colorize: bool) -> String {
         text.to_string()
     }
 }
+
+fn score_color_code(score: f32) -> &'static str {
+    if score >= 0.9 {
+        "32" // green
+    } else if score >= 0.75 {
+        "33" // yellow
+    } else {
+        "31" // red
+    }
+}
+
+fn format_effective_config(
+    viewport: &Viewport,
+    threshold: f64,
+    nav_timeout: u64,
+    network_idle_timeout: u64,
+    process_timeout: u64,
+    weights: &ScoreWeights,
+    config_source: Option<&Path>,
+) -> String {
+    let source = config_source
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "defaults".to_string());
+    format!(
+        "Effective config [{source}]: viewport={}x{}, threshold={:.2}, timeouts: nav={}s, network-idle={}s, process={}s, weights: pixel={:.2}, layout={:.2}, typography={:.2}, color={:.2}, content={:.2}",
+        viewport.width,
+        viewport.height,
+        threshold,
+        nav_timeout,
+        network_idle_timeout,
+        process_timeout,
+        weights.pixel,
+        weights.layout,
+        weights.typography,
+        weights.color,
+        weights.content
+    )
+}
 fn exit_code_for_compare(passed: bool) -> ExitCode {
     if passed {
         ExitCode::SUCCESS
@@ -1175,8 +1435,14 @@ fn exit_code_for_compare(passed: bool) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dpc_lib::types::{BoundingBox, DomNode, DomSnapshot};
+    use dpc_lib::config::{MetricWeights, Timeouts};
+    use dpc_lib::types::{
+        BoundingBox, ColorMetric, DomNode, DomSnapshot, LayoutMetric, MetricScores, PixelMetric,
+        ResourceKind, Viewport,
+    };
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     fn make_node(id: &str, tag: &str, class: Option<&str>) -> DomNode {
         let mut attrs = HashMap::new();
@@ -1250,6 +1516,115 @@ mod tests {
     }
 
     #[test]
+    fn resolve_compare_settings_prefers_config_when_flags_absent() {
+        let cfg = Config {
+            viewport: Viewport {
+                width: 111,
+                height: 222,
+            },
+            threshold: 0.5,
+            metric_weights: MetricWeights {
+                pixel: 1.0,
+                layout: 2.0,
+                typography: 3.0,
+                color: 4.0,
+                content: 5.0,
+            },
+            timeouts: Timeouts {
+                navigation: Duration::from_secs(5),
+                network_idle: Duration::from_secs(6),
+                process: Duration::from_secs(7),
+            },
+        };
+        let flags = CompareFlagSources::default();
+        let resolved = resolve_compare_settings(
+            Viewport {
+                width: 999,
+                height: 999,
+            },
+            0.9,
+            30,
+            10,
+            45,
+            &cfg,
+            &flags,
+        );
+
+        assert_eq!(resolved.viewport.width, 111);
+        assert_eq!(resolved.viewport.height, 222);
+        assert_eq!(resolved.threshold, 0.5);
+        assert_eq!(resolved.nav_timeout, 5);
+        assert_eq!(resolved.network_idle_timeout, 6);
+        assert_eq!(resolved.process_timeout, 7);
+        assert!((resolved.weights.pixel - 1.0).abs() < f32::EPSILON);
+        assert!((resolved.weights.content - 5.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn resolve_compare_settings_prefers_cli_when_flags_present() {
+        let cfg = Config::default();
+        let flags = CompareFlagSources {
+            viewport: true,
+            threshold: true,
+            nav_timeout: true,
+            network_idle_timeout: true,
+            process_timeout: true,
+        };
+        let resolved = resolve_compare_settings(
+            Viewport {
+                width: 10,
+                height: 20,
+            },
+            0.9,
+            50,
+            60,
+            70,
+            &cfg,
+            &flags,
+        );
+
+        assert_eq!(resolved.viewport.width, 10);
+        assert_eq!(resolved.viewport.height, 20);
+        assert_eq!(resolved.threshold, 0.9);
+        assert_eq!(resolved.nav_timeout, 50);
+        assert_eq!(resolved.network_idle_timeout, 60);
+        assert_eq!(resolved.process_timeout, 70);
+    }
+
+    #[test]
+    fn format_effective_config_includes_all_fields() {
+        let summary = format_effective_config(
+            &Viewport {
+                width: 1280,
+                height: 720,
+            },
+            0.9,
+            12,
+            8,
+            45,
+            &ScoreWeights {
+                pixel: 0.3,
+                layout: 0.25,
+                typography: 0.2,
+                color: 0.15,
+                content: 0.1,
+            },
+            Some(Path::new("dpc.toml")),
+        );
+        assert!(summary.contains("1280x720"));
+        assert!(summary.contains("threshold=0.90"));
+        assert!(summary.contains("nav=12s"));
+        assert!(summary.contains("network-idle=8s"));
+        assert!(summary.contains("process=45s"));
+        assert!(summary.contains("pixel=0.30"));
+        assert!(summary.contains("layout=0.25"));
+        assert!(summary.contains("typography=0.20"));
+        assert!(summary.contains("color=0.15"));
+        assert!(summary.contains("content=0.10"));
+        assert!(summary.contains("dpc.toml"));
+    }
+
+    #[test]
     fn render_error_always_returns_fatal_exit_code() {
         let code = render_error(
             DpcError::Config("boom".to_string()),
@@ -1257,6 +1632,70 @@ mod tests {
             None,
         );
         assert_eq!(code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn format_pretty_includes_status_metrics_and_artifacts() {
+        let metrics = MetricScores {
+            pixel: Some(PixelMetric {
+                score: 0.99,
+                diff_regions: vec![],
+            }),
+            layout: Some(LayoutMetric {
+                score: 0.75,
+                diff_regions: vec![],
+            }),
+            typography: None,
+            color: Some(ColorMetric {
+                score: 0.80,
+                diffs: vec![],
+            }),
+            content: None,
+        };
+        let artifacts = CompareArtifacts {
+            directory: PathBuf::from("/tmp/dpc-run"),
+            kept: true,
+            ref_screenshot: Some(PathBuf::from("/tmp/dpc-run/ref.png")),
+            impl_screenshot: Some(PathBuf::from("/tmp/dpc-run/impl.png")),
+            diff_image: Some(PathBuf::from("/tmp/dpc-run/diff.png")),
+            ref_dom_snapshot: None,
+            impl_dom_snapshot: None,
+            ref_figma_snapshot: None,
+            impl_figma_snapshot: None,
+        };
+        let output = DpcOutput::Compare(CompareOutput {
+            version: DPC_OUTPUT_VERSION.to_string(),
+            ref_resource: dpc_lib::output::ResourceDescriptor {
+                kind: ResourceKind::Image,
+                value: "ref.png".into(),
+            },
+            impl_resource: dpc_lib::output::ResourceDescriptor {
+                kind: ResourceKind::Image,
+                value: "impl.png".into(),
+            },
+            viewport: Viewport {
+                width: 1440,
+                height: 900,
+            },
+            similarity: 0.96,
+            threshold: 0.95,
+            passed: true,
+            metrics,
+            summary: Some(Summary {
+                top_issues: vec!["Design parity check passed".into()],
+            }),
+            artifacts: Some(artifacts),
+        });
+
+        let pretty = format_pretty(&output, false);
+        assert!(pretty.contains("PASS Design parity check"));
+        assert!(pretty.contains("Similarity"));
+        assert!(pretty.contains("Metrics:"));
+        assert!(pretty.contains("pixel") && pretty.contains("0.99"));
+        assert!(pretty.contains("layout") && pretty.contains("0.75"));
+        assert!(pretty.contains("color") && pretty.contains("0.80"));
+        assert!(pretty.contains("Artifacts:"));
+        assert!(pretty.contains("refScreenshot"));
     }
 
     #[test]
@@ -1278,7 +1717,7 @@ mod tests {
     }
 
     #[test]
-    fn format_pretty_plain_includes_status_and_metrics() {
+    fn format_pretty_includes_status_and_metrics_simple() {
         let output = DpcOutput::Compare(CompareOutput {
             version: DPC_OUTPUT_VERSION.to_string(),
             ref_resource: ResourceDescriptor {
@@ -1314,33 +1753,17 @@ mod tests {
             artifacts: None,
         });
 
-        let pretty = format_pretty_plain(&output);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&pretty).expect("pretty output should be JSON");
-        assert_eq!(parsed.get("mode").and_then(|v| v.as_str()), Some("compare"));
-        assert_eq!(parsed.get("passed").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(
-            parsed
-                .get("metrics")
-                .and_then(|m| m.get("pixel"))
-                .and_then(|p| p.get("score"))
-                .and_then(|s| s.as_f64()),
-            Some(0.96)
-        );
-        let top_issues = parsed
-            .get("summary")
-            .and_then(|s| s.get("topIssues"))
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            !top_issues.is_empty(),
-            "expected top issues to be included"
-        );
+        let pretty = format_pretty(&output, false);
+        assert!(pretty.contains("PASS Design parity check"));
+        assert!(pretty.contains("Similarity"));
+        assert!(pretty.contains("threshold"));
+        assert!(pretty.contains("Metrics:"));
+        assert!(pretty.contains("pixel") && pretty.contains("0.96"));
+        assert!(pretty.contains("Top issues") || pretty.contains("Top issues (max 5):"));
     }
 
     #[test]
-    fn format_pretty_plain_handles_errors() {
+    fn format_pretty_handles_errors() {
         let output = DpcOutput::Error(ErrorOutput {
             version: DPC_OUTPUT_VERSION.to_string(),
             message: Some("bad input".to_string()),
@@ -1351,26 +1774,8 @@ mod tests {
             },
         });
 
-        let pretty = format_pretty_plain(&output);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&pretty).expect("pretty output should be JSON");
-        assert_eq!(parsed.get("mode").and_then(|v| v.as_str()), Some("error"));
-        assert_eq!(
-            parsed
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str()),
-            Some("bad input")
-        );
-        let remediation = parsed
-            .get("error")
-            .and_then(|e| e.get("remediation"))
-            .and_then(|m| m.as_str())
-            .unwrap_or_default()
-            .to_string();
-        assert!(
-            remediation.contains("check flags"),
-            "should include remediation hint, got {remediation}"
-        );
+        let pretty = format_pretty(&output, false);
+        assert!(pretty.contains("[ERROR] bad input"));
+        assert!(pretty.contains("Hint: check flags"));
     }
 }
